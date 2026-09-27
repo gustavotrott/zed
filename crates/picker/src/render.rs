@@ -80,6 +80,7 @@ impl<D: PickerDelegate> Render for Picker<D> {
 
         div()
             .relative()
+            .on_action(cx.listener(Self::toggle_focus_preview))
             .child(content)
             .when(self.is_resizable(), |this| {
                 this.left(self.shape.horizontal_offset(window))
