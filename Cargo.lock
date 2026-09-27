@@ -13487,6 +13487,7 @@ dependencies = [
  "settings",
  "ui",
  "util",
+ "workspace",
 ]
 
 [[package]]

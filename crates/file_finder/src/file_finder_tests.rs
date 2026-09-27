@@ -4415,6 +4415,93 @@ async fn test_reopen_with_preview_keeps_results_width(cx: &mut TestAppContext) {
     cx.run_until_parked();
 }
 
+#[gpui::test]
+async fn test_editable_preview(cx: &mut TestAppContext) {
+    let app_state = init_test(cx);
+    cx.update(|cx| {
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.editable_picker_preview = Some(true);
+            });
+        })
+    });
+    app_state
+        .fs
+        .as_fake()
+        .insert_tree(
+            path!("/root"),
+            json!({ "first.txt": "hello", "second.txt": "world" }),
+        )
+        .await;
+    let project = Project::test(app_state.fs.clone(), [path!("/root").as_ref()], cx).await;
+    let (picker, workspace, cx) = build_find_picker(project, cx);
+
+    cx.dispatch_action(picker::SetPreviewRight);
+    simulate_input(cx, "first");
+
+    cx.dispatch_action(picker::ToggleFocusPreview);
+    cx.run_until_parked();
+    picker.update_in(cx, |picker, window, cx| {
+        assert!(
+            !picker.focus_handle(cx).is_focused(window),
+            "focus should move from the query to the preview"
+        );
+    });
+
+    cx.simulate_input("X");
+    cx.run_until_parked();
+    assert_eq!(
+        active_file_picker(&workspace, cx),
+        picker,
+        "focusing and editing the preview must not dismiss the picker"
+    );
+    assert_eq!(picker.update(cx, |picker, cx| picker.query(cx)), "first");
+
+    cx.dispatch_action(picker::ToggleFocusPreview);
+    cx.run_until_parked();
+    picker.update_in(cx, |picker, window, cx| {
+        assert!(picker.focus_handle(cx).is_focused(window));
+        picker.set_query("second", window, cx);
+    });
+    cx.executor().advance_clock(SEARCH_DEBOUNCE);
+    cx.run_until_parked();
+
+    assert_eq!(
+        app_state
+            .fs
+            .load(path!("/root/first.txt").as_ref())
+            .await
+            .unwrap(),
+        "Xhello",
+        "the preview cursor should start at the top of the file and edits should be \
+        saved when previewing another result"
+    );
+
+    cx.dispatch_action(picker::ToggleFocusPreview);
+    cx.run_until_parked();
+    cx.simulate_input("Y");
+    cx.dispatch_action(picker::ToggleFocusPreview);
+    cx.run_until_parked();
+    cx.dispatch_action(Cancel);
+    cx.run_until_parked();
+    assert_eq!(
+        app_state
+            .fs
+            .load(path!("/root/second.txt").as_ref())
+            .await
+            .unwrap(),
+        "Yworld",
+        "edits should be saved when the picker is dismissed"
+    );
+
+    open_file_picker(&workspace, cx);
+    cx.run_until_parked();
+
+    // Reset the persisted preview layout so it doesn't leak into other tests.
+    cx.dispatch_action(picker::SetPreviewHidden);
+    cx.run_until_parked();
+}
+
 async fn open_close_queried_buffer(
     input: &str,
     expected_matches: usize,

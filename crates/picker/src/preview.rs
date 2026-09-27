@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{AnyElement, App, Entity, IntoElement, Window};
+use gpui::{AnyElement, App, Entity, FocusHandle, IntoElement, Window};
 use language::{Anchor, Buffer, HighlightedText};
 
 /// The editor-agnostic interface a [`Picker`](crate::Picker) uses to drive its
@@ -14,6 +14,16 @@ pub trait PreviewBackend: 'static {
     fn adjust_to_new_size(&self, window: &mut Window, cx: &mut App);
     /// Empty the preview and show a placeholder message.
     fn clear(&self, cx: &mut App);
+    /// The focus handle of the preview, if it can take focus (e.g. to be edited).
+    fn focus_handle(&self, _cx: &App) -> Option<FocusHandle> {
+        None
+    }
+    /// Whether the preview currently shows content that can take focus.
+    fn can_focus(&self, _cx: &App) -> bool {
+        false
+    }
+    /// Called when the picker is dismissed.
+    fn dismissed(&self, _cx: &mut App) {}
 }
 
 /// The preview window of a [`Picker`](crate::Picker).
@@ -52,6 +62,22 @@ impl Preview {
 
     pub(crate) fn clear(&self, cx: &mut App) {
         self.content.clear(cx);
+    }
+
+    pub(crate) fn dismissed(&self, cx: &mut App) {
+        self.content.dismissed(cx);
+    }
+
+    pub(crate) fn focus_handle(&self, cx: &App) -> Option<FocusHandle> {
+        self.content.focus_handle(cx)
+    }
+
+    /// The focus handle of the preview, if it's visible and can take focus right now.
+    pub(crate) fn focusable_handle(&self, cx: &App) -> Option<FocusHandle> {
+        if self.layout == Layout::Hidden || !self.content.can_focus(cx) {
+            return None;
+        }
+        self.content.focus_handle(cx)
     }
 }
 

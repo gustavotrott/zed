@@ -21,6 +21,14 @@
       "cmd-alt-right": "picker::SetPreviewRight",
       "cmd-alt-down": "picker::SetPreviewBelow",
       "cmd-alt-up": "picker::SetPreviewHidden",
+      "cmd-alt-o": "picker::ToggleFocusPreview",
+    },
+  },
+  {
+    "context": "PickerPreview > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-alt-o": "picker::ToggleFocusPreview",
     },
   },
   {

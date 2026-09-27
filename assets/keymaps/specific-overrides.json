@@ -19,6 +19,13 @@
       "ctrl-alt-right": "picker::SetPreviewRight",
       "ctrl-alt-down": "picker::SetPreviewBelow",
       "ctrl-alt-up": "picker::SetPreviewHidden",
+      "ctrl-alt-o": "picker::ToggleFocusPreview",
+    },
+  },
+  {
+    "context": "PickerPreview > Editor",
+    "bindings": {
+      "ctrl-alt-o": "picker::ToggleFocusPreview",
     },
   },
   {

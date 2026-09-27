@@ -75,6 +75,8 @@ actions!(
         ToggleActionsMenu,
         /// Take the picker's content and open it in a multibuffer
         ToMultiBuffer,
+        /// Moves focus between the query and the preview, when the preview is editable.
+        ToggleFocusPreview,
     ]
 );
 
@@ -551,6 +553,24 @@ impl<D: PickerDelegate> Picker<D> {
             let focus_handle = this.focus_handle(cx);
             workspace::register_reopenable_picker(&focus_handle, cx);
         }
+        if this.preview.is_some() {
+            cx.subscribe_self(|this, _: &DismissEvent, cx| {
+                if let Some(preview) = &this.preview {
+                    preview.dismissed(cx);
+                }
+            })
+            .detach();
+        }
+        if let Some(preview_focus_handle) = this
+            .preview
+            .as_ref()
+            .and_then(|preview| preview.focus_handle(cx))
+        {
+            cx.on_blur(&preview_focus_handle, window, |this, window, cx| {
+                this.dismiss_if_focus_left(window, cx);
+            })
+            .detach();
+        }
         this.update_matches("".to_string(), window, cx);
         // give the delegate 4ms to render the first set of suggestions.
         this.delegate
@@ -994,16 +1014,51 @@ impl<D: PickerDelegate> Picker<D> {
                 let query = editor.text(cx);
                 self.update_matches(query, window, cx);
             }
-            ErasedEditorEvent::Blurred => {
-                // Opening a footer/search-bar menu blurs the editor; don't
-                // dismiss the picker while such a menu is open/focused.
-                let menu_focused = self.actions_menu_handle.is_focused(window, cx)
-                    || self.actions_menu_handle.is_deployed()
-                    || self.delegate.has_another_open_menu(window, cx);
-                if self.draws_own_container() && window.is_window_active() && !menu_focused {
-                    self.cancel(&menu::Cancel, window, cx);
-                }
-            }
+            ErasedEditorEvent::Blurred => self.dismiss_if_focus_left(window, cx),
+        }
+    }
+
+    fn dismiss_if_focus_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Opening a footer/search-bar menu blurs the editor; don't
+        // dismiss the picker while such a menu is open/focused.
+        let menu_focused = self.actions_menu_handle.is_focused(window, cx)
+            || self.actions_menu_handle.is_deployed()
+            || self.delegate.has_another_open_menu(window, cx);
+        // Focus moving between the query and an editable preview stays within the picker.
+        let picker_focused = self.focus_handle(cx).contains_focused(window, cx)
+            || self.preview_contains_focus(window, cx);
+        if self.draws_own_container()
+            && window.is_window_active()
+            && !menu_focused
+            && !picker_focused
+        {
+            self.cancel(&menu::Cancel, window, cx);
+        }
+    }
+
+    fn preview_contains_focus(&self, window: &Window, cx: &App) -> bool {
+        self.preview
+            .as_ref()
+            .and_then(|preview| preview.focus_handle(cx))
+            .is_some_and(|focus_handle| focus_handle.contains_focused(window, cx))
+    }
+
+    fn toggle_focus_preview(
+        &mut self,
+        _: &ToggleFocusPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview_contains_focus(window, cx) {
+            self.focus(window, cx);
+        } else if let Some(preview_focus_handle) = self
+            .preview
+            .as_ref()
+            .and_then(|preview| preview.focusable_handle(cx))
+        {
+            preview_focus_handle.focus(window, cx);
+        } else {
+            cx.propagate();
         }
     }
 

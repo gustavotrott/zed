@@ -241,6 +241,9 @@
   // When set to false, Zed will use its built-in prompts. Note that on Linux,
   // this option is ignored and Zed will always use the built-in prompts.
   "use_system_prompts": true,
+  // Whether the preview of pickers like the text finder and file finder can be
+  // edited. Edits are saved when selecting another result or closing the picker.
+  "editable_picker_preview": false,
   // Whether the cursor blinks in the editor.
   "cursor_blink": true,
   // Cursor shape for the default editor.

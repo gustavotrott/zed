@@ -24,3 +24,4 @@ rope.workspace = true
 settings.workspace = true
 ui.workspace = true
 util.workspace = true
+workspace.workspace = true

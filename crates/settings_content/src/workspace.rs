@@ -89,6 +89,11 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: true
     pub use_system_prompts: Option<bool>,
+    /// Whether the preview of pickers like the text finder and file finder can
+    /// be edited. Edits are saved when selecting another result or closing the picker.
+    ///
+    /// Default: false
+    pub editable_picker_preview: Option<bool>,
     /// Aliases for the command palette. When you type a key in this map,
     /// it will be assumed to equal the value.
     ///
