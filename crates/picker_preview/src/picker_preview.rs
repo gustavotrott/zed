@@ -6,15 +6,15 @@ use gpui::{
     Action, AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _,
     IntoElement, Pixels, StyledText, Subscription, Task, TaskExt as _, WeakEntity, Window, px,
 };
-use language::{Buffer, HighlightedText, HighlightedTextBuilder, ToPoint};
+use language::{Bias, Buffer, HighlightedText, HighlightedTextBuilder, ToPoint};
 use picker::{
-    MatchLocation, PreviewBackend, PreviewLayout, PreviewSource, PreviewUpdate, ToMultiBuffer,
-    ToggleFocusPreview,
+    MatchLocation, PreviewBackend, PreviewLayout, PreviewSource, PreviewUpdate, ToggleFocusPreview,
 };
-use project::Project;
+use project::{Project, Symbol};
 use rope::Point;
 use settings::Settings;
 use ui::{ActiveTheme, Color, div, prelude::*, v_flex};
+use util::ResultExt as _;
 use util::rel_path::RelPath;
 use workspace::WorkspaceSettings;
 
@@ -92,6 +92,8 @@ struct EditorPreview {
     /// Whether the preview editor made edits to `current_buffer` that haven't been saved yet.
     has_unsaved_edits: bool,
     _subscriptions: Vec<Subscription>,
+    /// Store the load preview task so we have only one at the time
+    pending_update: Task<()>,
 }
 
 impl EditorPreview {
@@ -145,6 +147,7 @@ impl EditorPreview {
             current_buffer: None,
             has_unsaved_edits: false,
             _subscriptions: subscriptions,
+            pending_update: Task::ready(()),
         };
         this.clear(); // picker starts with no results.
         this
@@ -192,6 +195,9 @@ impl EditorPreview {
                 self.update_from_buffer(buffer, highlight, window, cx);
                 cx.notify();
             }
+            PreviewSource::Symbol(symbol) => {
+                self.update_from_symbol(symbol, window, cx);
+            }
             PreviewSource::Message(message) => {
                 self.save_edits(cx);
                 self.message = Some(message);
@@ -220,15 +226,41 @@ impl EditorPreview {
             }
         });
 
-        cx.spawn_in(window, async move |this, cx| {
-            let buffer = open_task.await?;
+        self.pending_update = cx.spawn_in(window, async move |this, cx| {
+            let Some(buffer) = open_task.await.log_err() else {
+                return;
+            };
             this.update_in(cx, |this, window, cx| {
                 this.update_from_buffer(buffer, highlight, window, cx);
                 cx.notify();
-            })?;
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
+            })
+            .ok();
+        });
+    }
+
+    fn update_from_symbol(&mut self, symbol: Symbol, window: &mut Window, cx: &mut Context<Self>) {
+        let open_task = self.project.update(cx, |project, cx| {
+            project.open_buffer_for_symbol(&symbol, cx)
+        });
+
+        self.pending_update = cx.spawn_in(window, async move |this, cx| {
+            let Some(buffer) = open_task.await.log_err() else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| {
+                let snapshot = buffer.read(cx).text_snapshot();
+                let start = snapshot.clip_point_utf16(symbol.range.start, Bias::Left);
+                let end = snapshot.clip_point_utf16(symbol.range.end, Bias::Left);
+                let highlight = MatchLocation {
+                    anchor_range: snapshot.anchor_before(start)..snapshot.anchor_after(end),
+                    range: snapshot.point_utf16_to_offset(start)
+                        ..snapshot.point_utf16_to_offset(end),
+                };
+                this.update_from_buffer(buffer, Some(highlight), window, cx);
+                cx.notify();
+            })
+            .ok();
+        });
     }
 
     fn update_from_buffer(
@@ -412,7 +444,7 @@ impl EditorPreview {
             div()
                 .flex_1()
                 .overflow_hidden()
-                .child(self.editor_as_giant_button())
+                .child(self.occluded_editor())
                 .into_any_element()
         }
     }
@@ -434,7 +466,7 @@ impl EditorPreview {
             .child(content)
     }
 
-    fn editor_as_giant_button(&self) -> impl IntoElement {
+    fn occluded_editor(&self) -> impl IntoElement {
         div()
             .relative()
             .size_full()
@@ -444,10 +476,7 @@ impl EditorPreview {
                     .id("picker-preview-editor")
                     .absolute()
                     .inset_0()
-                    .occlude()
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(ToMultiBuffer.boxed_clone(), cx);
-                    }),
+                    .occlude(),
             )
     }
 }

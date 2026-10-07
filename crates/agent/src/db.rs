@@ -1,8 +1,9 @@
 use crate::{AgentMessage, AgentMessageContent, UserMessage, UserMessageContent};
 use acp_thread::ClientUserMessageId;
 use agent_client_protocol::schema::v1 as acp;
+use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::AgentProfileId;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, IndexMap};
 use futures::{FutureExt, future::Shared};
@@ -76,7 +77,7 @@ pub struct DbThread {
     #[serde(default)]
     pub thinking_effort: Option<String>,
     #[serde(default)]
-    pub draft_prompt: Option<Vec<acp::ContentBlock>>,
+    pub draft_prompt: Option<Vec<acp_v2::ContentBlock>>,
     #[serde(default)]
     pub ui_scroll_position: Option<SerializedScrollPosition>,
     #[serde(default)]
@@ -93,9 +94,13 @@ pub struct DbThread {
 /// thread blob; round-trips with [`crate::sandboxing::ThreadSandboxGrants`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DbSandboxGrants {
-    /// Canonicalized paths granted write access; each covers its whole subtree.
+    /// Paths granted write access, each paired with the canonical
+    /// (symlink-resolved) target established when the grant was approved; each
+    /// covers its whole subtree. Legacy rows stored a bare path string per
+    /// entry, which still deserializes (as a grant with no resolved canonical)
+    /// via [`settings::GrantedWritePath`]'s string-or-object format.
     #[serde(default)]
-    pub write_paths: Vec<PathBuf>,
+    pub write_paths: Vec<settings::GrantedWritePath>,
     /// Host patterns granted network access, in canonical string form (e.g.
     /// `github.com`, `*.npmjs.org`). Parsed back into patterns on load.
     #[serde(default)]
@@ -107,9 +112,7 @@ pub struct DbSandboxGrants {
     /// granted.
     #[serde(default)]
     pub allow_fs_write_all: bool,
-    /// Whether access to protected Git directories (`.git`) was granted.
-    #[serde(default)]
-    pub allow_git_access: bool,
+
     /// Whether the model-requested fully-unsandboxed escape was granted.
     #[serde(default)]
     pub unsandboxed: bool,
@@ -283,7 +286,9 @@ impl DbThread {
                                 name: tool_use.name.into(),
                                 raw_input: serde_json::to_string(&tool_use.input)
                                     .unwrap_or_default(),
-                                input: tool_use.input,
+                                input: language_model::LanguageModelToolUseInput::Json(
+                                    tool_use.input,
+                                ),
                                 is_input_complete: true,
                                 thought_signature: None,
                             },
@@ -388,6 +393,14 @@ impl Column for DataType {
 pub(crate) struct ThreadsDatabase {
     executor: BackgroundExecutor,
     connection: Arc<Mutex<Connection>>,
+    /// In production, saves take real time (serialization, zstd, disk I/O) while
+    /// the user keeps typing, so new save requests routinely arrive mid-write.
+    /// The test executor completes writes instantly, so tests use this gate to
+    /// hold a write in flight and interleave more save requests with it.
+    #[cfg(test)]
+    write_gate: Mutex<Option<Shared<futures::channel::oneshot::Receiver<()>>>>,
+    #[cfg(test)]
+    save_count: std::sync::atomic::AtomicUsize,
 }
 
 struct GlobalThreadsDatabase(Shared<Task<Result<Arc<ThreadsDatabase>, Arc<anyhow::Error>>>>);
@@ -446,7 +459,7 @@ impl ThreadsDatabase {
                 data BLOB NOT NULL
             )
         "})?()
-        .map_err(|e| anyhow!("Failed to create threads table: {}", e))?;
+        .map_err(|e| e.context("Failed to create threads table"))?;
 
         if let Ok(mut s) = connection.exec(indoc! {"
             ALTER TABLE threads ADD COLUMN parent_id TEXT
@@ -477,6 +490,10 @@ impl ThreadsDatabase {
         let db = Self {
             executor,
             connection: Arc::new(Mutex::new(connection)),
+            #[cfg(test)]
+            write_gate: Mutex::new(None),
+            #[cfg(test)]
+            save_count: Default::default(),
         };
 
         Ok(db)
@@ -625,9 +642,29 @@ impl ThreadsDatabase {
         folder_paths: PathList,
     ) -> Task<Result<()>> {
         let connection = self.connection.clone();
+        #[cfg(test)]
+        let write_gate = self.write_gate.lock().clone();
+        #[cfg(test)]
+        self.save_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        self.executor
-            .spawn(async move { Self::save_thread_sync(&connection, id, thread, &folder_paths) })
+        self.executor.spawn(async move {
+            #[cfg(test)]
+            if let Some(write_gate) = write_gate {
+                write_gate.await.ok();
+            }
+            Self::save_thread_sync(&connection, id, thread, &folder_paths)
+        })
+    }
+
+    #[cfg(test)]
+    pub fn save_count(&self) -> usize {
+        self.save_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub fn set_write_gate(&self, gate: futures::channel::oneshot::Receiver<()>) {
+        *self.write_gate.lock() = Some(gate.shared());
     }
 
     fn deserialize_thread(data_type: DataType, data: Vec<u8>) -> Result<DbThread> {
@@ -905,6 +942,58 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_draft_prompt_preserves_legacy_and_v2_content(cx: &mut TestAppContext) {
+        let legacy_draft = serde_json::to_value(vec![
+            acp::ContentBlock::Text(acp::TextContent::new("legacy draft")),
+            acp::ContentBlock::ResourceLink(acp::ResourceLink::new("file", "file:///a.md")),
+        ])
+        .expect("serialize v1 draft");
+        let mut thread: DbThread = serde_json::from_value(serde_json::json!({
+            "title": "Draft Thread",
+            "messages": [],
+            "updated_at": "2024-01-01T00:00:00Z",
+            "draft_prompt": legacy_draft,
+        }))
+        .expect("decode legacy thread with v2 draft blocks");
+        assert_eq!(
+            serde_json::to_value(&thread.draft_prompt).expect("serialize decoded draft"),
+            legacy_draft
+        );
+
+        let extension = serde_json::json!({
+            "type": "_draft_card",
+            "payload": {"items": [1, {"enabled": true}], "optional": null},
+            "_meta": {"source": "draft", "nested": {"version": 2}},
+        });
+        let extension_block: acp_v2::ContentBlock =
+            serde_json::from_value(extension.clone()).expect("decode v2-only draft block");
+        assert!(matches!(extension_block, acp_v2::ContentBlock::Other(_)));
+        thread
+            .draft_prompt
+            .as_mut()
+            .expect("legacy draft exists")
+            .push(extension_block);
+        let mut expected = legacy_draft.as_array().expect("draft is an array").clone();
+        expected.push(extension);
+
+        let database = ThreadsDatabase::new(cx.executor()).expect("create database");
+        let thread_id = session_id("draft-thread");
+        database
+            .save_thread(thread_id.clone(), thread, PathList::default())
+            .await
+            .expect("save mixed-version draft");
+        let restored = database
+            .load_thread(thread_id)
+            .await
+            .expect("load draft")
+            .expect("saved thread exists");
+        assert_eq!(
+            serde_json::to_value(restored.draft_prompt).expect("serialize restored draft"),
+            serde_json::Value::Array(expected)
+        );
+    }
+
     #[test]
     fn test_sandboxed_terminal_temp_dir_defaults_to_none() {
         let json = r#"{
@@ -947,10 +1036,18 @@ mod tests {
             Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
         );
         let grants = DbSandboxGrants {
-            write_paths: vec![PathBuf::from("/tmp/build")],
+            write_paths: vec![
+                // A legacy bare-string grant (no resolved canonical) and a grant
+                // carrying its resolved canonical, to exercise both forms of the
+                // string-or-object round-trip.
+                settings::GrantedWritePath::from_requested(PathBuf::from("/tmp/build")),
+                settings::GrantedWritePath::resolved(
+                    PathBuf::from("/tmp/link"),
+                    PathBuf::from("/tmp/real"),
+                ),
+            ],
             network_hosts: vec!["github.com".to_string(), "*.npmjs.org".to_string()],
             network_any_host: false,
-            allow_git_access: true,
             allow_fs_write_all: false,
             unsandboxed: true,
             sandbox_fallback: true,
