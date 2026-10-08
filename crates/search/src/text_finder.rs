@@ -17,7 +17,9 @@ use project::ProjectPath;
 use settings::SeedQuerySetting;
 use text::Anchor;
 use ui::Window;
-use workspace::{DismissDecision, ItemHandle, ModalView, Workspace, WorkspaceDb, WorkspaceId};
+use workspace::{
+    DeploySearch, DismissDecision, ItemHandle, ModalView, Workspace, WorkspaceDb, WorkspaceId,
+};
 
 mod delegate;
 mod render;
@@ -83,6 +85,14 @@ impl TextFinderDb {
 pub(crate) struct SearchSeed {
     query: String,
     options: Option<SearchOptions>,
+}
+
+/// Search filters requested by whoever opens the finder, applied on top of the restored ones.
+#[derive(Default)]
+pub(crate) struct OpenFilters {
+    included_files: Option<String>,
+    excluded_files: Option<String>,
+    option_overrides: Vec<(SearchOptions, bool)>,
 }
 
 fn store_last_search(
@@ -158,7 +168,14 @@ impl TextFinder {
                     remove_project_search_tab(project_search_item_id, workspace, window, cx);
                     let workspace_id = workspace.database_id();
                     workspace.toggle_modal(window, cx, |window, cx| {
-                        Self::new(delegate, None, workspace_id, window, cx)
+                        Self::new(
+                            delegate,
+                            None,
+                            OpenFilters::default(),
+                            workspace_id,
+                            window,
+                            cx,
+                        )
                     });
                 })
                 .ok();
@@ -389,8 +406,53 @@ impl TextFinder {
         None
     }
 
+    /// Opens the finder in place of a project search tab, honoring the query and
+    /// filters of `action`. See `SearchSettings::use_text_finder_for_project_search`.
+    pub(crate) fn deploy(
+        workspace: &mut Workspace,
+        action: &DeploySearch,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        if workspace.active_modal::<Self>(cx).is_some() {
+            return;
+        }
+        let seed_query = Self::seed_query(workspace, window, cx);
+        let seed_query = match action.query.as_ref().filter(|query| !query.is_empty()) {
+            Some(query) => Some(SearchSeed {
+                query: query.clone(),
+                options: seed_query.and_then(|seed| seed.options),
+            }),
+            None => seed_query,
+        };
+        let option_overrides = [
+            (SearchOptions::REGEX, action.regex),
+            (SearchOptions::CASE_SENSITIVE, action.case_sensitive),
+            (SearchOptions::WHOLE_WORD, action.whole_word),
+            (SearchOptions::INCLUDE_IGNORED, action.include_ignored),
+        ]
+        .into_iter()
+        .filter_map(|(option, enabled)| Some((option, enabled?)))
+        .collect();
+        let filters = OpenFilters {
+            included_files: action.included_files.clone(),
+            excluded_files: action.excluded_files.clone(),
+            option_overrides,
+        };
+        Self::open_with_filters(seed_query, filters, window, cx).detach();
+    }
+
     pub(crate) fn open(
         seed_query: Option<SearchSeed>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Task<()> {
+        Self::open_with_filters(seed_query, OpenFilters::default(), window, cx)
+    }
+
+    fn open_with_filters(
+        seed_query: Option<SearchSeed>,
+        filters: OpenFilters,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Task<()> {
@@ -406,7 +468,7 @@ impl TextFinder {
                 .update_in(cx, |workspace, window, cx| {
                     let workspace_id = workspace.database_id();
                     workspace.toggle_modal(window, cx, |window, cx| {
-                        Self::new(delegate, seed_query, workspace_id, window, cx)
+                        Self::new(delegate, seed_query, filters, workspace_id, window, cx)
                     });
                 })
                 .ok();
@@ -416,10 +478,19 @@ impl TextFinder {
     fn new(
         delegate: Delegate,
         seed_query: Option<SearchSeed>,
+        filters: OpenFilters,
         workspace_id: Option<WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        delegate.project_search_view.update(cx, |view, cx| {
+            view.set_path_filters(
+                filters.included_files.as_deref(),
+                filters.excluded_files.as_deref(),
+                window,
+                cx,
+            );
+        });
         let project = delegate.project(cx).clone();
         let languages = project.read(cx).languages().clone();
         let preview = picker_preview::editor_preview(project, window, cx);
@@ -440,11 +511,14 @@ impl TextFinder {
             picker.delegate.focus_handle = picker_focus_handle.clone();
             picker.delegate.query_editor = Some(query_editor);
             picker.delegate.hook_up_any_ongoing_search(picker_weak, cx);
+            // Restore filters before seeding the query so the initial search runs with them.
+            if let Some(options) = seed_query.as_ref().and_then(|seed| seed.options) {
+                picker.delegate.search_options = options;
+            }
+            for (option, enabled) in filters.option_overrides {
+                picker.delegate.search_options.set(option, enabled);
+            }
             if let Some(seed_query) = seed_query {
-                // Restore filters before seeding the query so the initial search runs with them.
-                if let Some(options) = seed_query.options {
-                    picker.delegate.search_options = options;
-                }
                 picker.set_query(&seed_query.query, window, cx);
                 picker.select_query(window, cx);
             }
@@ -534,7 +608,7 @@ pub struct SearchMatch {
 mod tests {
     use std::sync::Arc;
 
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{TestAppContext, UpdateGlobal as _, VisualTestContext};
     use project::{FakeFs, Project};
     use serde_json::json;
     use settings::SettingsStore;
@@ -597,6 +671,87 @@ mod tests {
 
         workspace.update(cx, |workspace, cx| {
             assert!(workspace.active_modal::<TextFinder>(cx).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_find_in_folder_opens_text_finder_when_enabled(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .editor
+                        .search
+                        .get_or_insert_default()
+                        .use_text_finder_for_project_search = Some(true);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "one.rs": "const NEEDLE: usize = 1;",
+                "sub": {"two.rs": "const NEEDLE: usize = 2;"},
+            }),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        cx.dispatch_action(zed_actions::search::NewSearchInDirectory {
+            directory: "sub".to_string(),
+        });
+        cx.run_until_parked();
+
+        let picker = workspace.update(cx, |workspace, cx| {
+            assert!(
+                workspace
+                    .items_of_type::<ProjectSearchView>(cx)
+                    .next()
+                    .is_none(),
+                "no project search tab should be opened"
+            );
+            workspace
+                .active_modal::<TextFinder>(cx)
+                .expect("Text Finder should be open")
+                .read(cx)
+                .picker
+                .clone()
+        });
+        picker.update(cx, |picker, cx| {
+            assert_eq!(
+                picker
+                    .delegate
+                    .project_search_view
+                    .read(cx)
+                    .included_files_filter(cx)
+                    .as_deref(),
+                Some("sub")
+            );
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.set_query("NEEDLE", window, cx);
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+
+        picker.update(cx, |picker, _| {
+            let paths: Vec<_> = picker
+                .delegate
+                .matches
+                .iter()
+                .map(|search_match| search_match.path.path.as_unix_str().to_string())
+                .collect();
+            assert_eq!(paths, vec!["sub/two.rs".to_string()]);
         });
     }
 

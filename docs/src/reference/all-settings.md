@@ -4197,7 +4197,8 @@ Non-negative `integer` values
     "include_ignored": false,
     "regex": false,
     "center_on_match": false,
-    "search_on_type": true
+    "search_on_type": true,
+    "use_text_finder_for_project_search": false
   }
 }
 ```
@@ -4245,6 +4246,12 @@ Non-negative `integer` values
 - Description: Start searching as you type in project search, without pressing Enter.
 - Setting: `search_on_type`
 - Default: `true`
+
+### Use Text Finder for Project Search
+
+- Description: Whether "Find in Project" (`pane::DeploySearch`) and the project panel's "Find in Folder" open the Text Finder modal instead of a Project Search tab. The folder is applied as an include filter, shown in the modal next to the query.
+- Setting: `use_text_finder_for_project_search`
+- Default: `false`
 
 ## Search Wrap
 

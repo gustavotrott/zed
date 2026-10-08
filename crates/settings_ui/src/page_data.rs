@@ -3716,7 +3716,7 @@ fn languages_and_tools_page(cx: &App) -> SettingsPage {
 }
 
 fn search_and_files_page() -> SettingsPage {
-    fn search_section() -> [SettingsPageItem; 10] {
+    fn search_section() -> [SettingsPageItem; 11] {
         [
             SettingsPageItem::SectionHeader("Search"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -3876,6 +3876,30 @@ fn search_and_files_page() -> SettingsPage {
                             .search
                             .get_or_insert_default()
                             .search_on_type = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Use Text Finder for Project Search",
+                description: "Open the Text Finder modal instead of a Project Search tab for Find in Project and Find in Folder.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("editor.search.use_text_finder_for_project_search"),
+                    pick: |settings_content| {
+                        settings_content
+                            .editor
+                            .search
+                            .as_ref()
+                            .and_then(|search| search.use_text_finder_for_project_search.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .editor
+                            .search
+                            .get_or_insert_default()
+                            .use_text_finder_for_project_search = value;
                     },
                 }),
                 metadata: None,
