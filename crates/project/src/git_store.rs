@@ -7332,12 +7332,13 @@ impl Repository {
     pub fn file_log(
         &mut self,
         path: RepoPath,
+        line_range: Option<std::ops::RangeInclusive<u32>>,
         commit_limit: usize,
     ) -> oneshot::Receiver<Result<Vec<FileLogEntry>>> {
         self.send_job("file_log", None, move |git_repo, _cx| async move {
             match git_repo {
                 RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
-                    backend.file_log(path, commit_limit).await
+                    backend.file_log(path, line_range, commit_limit).await
                 }
                 RepositoryState::Remote(_) => {
                     anyhow::bail!("browsing file history is only supported locally")

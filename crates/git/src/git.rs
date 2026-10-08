@@ -64,6 +64,9 @@ actions!(
         /// Browses the commits that changed the current file in a picker, previewing the
         /// file's diff in each commit.
         BrowseFileHistory,
+        /// Browses the commits that changed the selected lines in a picker, previewing the
+        /// file's diff in each commit.
+        ShowHistoryForSelection,
         /// Opens a permalink for the selected file on its Git hosting provider.
         OpenFilePermalink,
         /// Copies a permalink for the selected file on its Git hosting provider.
