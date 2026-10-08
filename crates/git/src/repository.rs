@@ -24,6 +24,7 @@ use text::LineEnding;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::ops::RangeInclusive;
 use std::sync::atomic::AtomicBool;
 
 use std::process::{ExitStatus, Output};
@@ -1144,9 +1145,13 @@ pub trait GitRepository: Send + Sync {
 
     /// Lists the latest `commit_limit` commits that changed the file at `path`, newest first,
     /// following renames.
+    ///
+    /// With `line_range`, the 1-based, inclusive range of lines of the file at `HEAD`, only
+    /// lists the commits that changed those lines (`git log -L`).
     fn file_log(
         &self,
         path: RepoPath,
+        line_range: Option<RangeInclusive<u32>>,
         commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileLogEntry>>>;
 
@@ -3604,21 +3609,36 @@ impl GitRepository for RealGitRepository {
     fn file_log(
         &self,
         path: RepoPath,
+        line_range: Option<RangeInclusive<u32>>,
         commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileLogEntry>>> {
         let git = self.git_binary();
         async move {
-            let max_count_arg = format!("--max-count={commit_limit}");
-            let args = [
-                "log",
-                max_count_arg.as_str(),
-                "--follow",
-                "--name-only",
-                "-z",
-                "--format=%x1e%H%x1f%an%x1f%at%x1f%s",
-                "--",
-                path.as_unix_str(),
+            let mut args = vec![
+                "log".to_string(),
+                format!("--max-count={commit_limit}"),
+                "-z".to_string(),
+                "--format=%x1e%H%x1f%an%x1f%at%x1f%s".to_string(),
             ];
+            match line_range {
+                // `-L` follows renames on its own and can't list the changed files, so the
+                // commits are reported with the queried path.
+                Some(line_range) => args.extend([
+                    "--no-patch".to_string(),
+                    format!(
+                        "-L{},{}:{}",
+                        line_range.start(),
+                        line_range.end(),
+                        path.as_unix_str()
+                    ),
+                ]),
+                None => args.extend([
+                    "--follow".to_string(),
+                    "--name-only".to_string(),
+                    "--".to_string(),
+                    path.as_unix_str().to_string(),
+                ]),
+            }
             let output = git.build_command(&args).output().await?;
             anyhow::ensure!(
                 output.status.success(),
@@ -4588,7 +4608,7 @@ mod tests {
         .unwrap();
 
         let log = repository
-            .file_log(repo_path("new.txt"), 100)
+            .file_log(repo_path("new.txt"), None, 100)
             .await
             .unwrap();
         let summary: Vec<_> = log
@@ -4610,8 +4630,36 @@ mod tests {
         );
         assert!(log.iter().all(|entry| entry.sha.len() == 40));
 
-        let limited = repository.file_log(repo_path("new.txt"), 1).await.unwrap();
+        let limited = repository
+            .file_log(repo_path("new.txt"), None, 1)
+            .await
+            .unwrap();
         assert_eq!(limited.len(), 1);
+
+        let second_line_log = repository
+            .file_log(repo_path("new.txt"), Some(2..=2), 100)
+            .await
+            .unwrap();
+        let subjects: Vec<_> = second_line_log
+            .iter()
+            .map(|entry| entry.subject.to_string())
+            .collect();
+        assert_eq!(subjects, vec!["edit: with \"quotes\"".to_string()]);
+
+        let first_line_log = repository
+            .file_log(repo_path("new.txt"), Some(1..=1), 100)
+            .await
+            .unwrap();
+        let subjects: Vec<_> = first_line_log
+            .iter()
+            .map(|entry| entry.subject.to_string())
+            .collect();
+        assert_eq!(subjects, vec!["add files".to_string()]);
+        assert!(
+            first_line_log
+                .iter()
+                .all(|entry| entry.path.as_unix_str() == "new.txt")
+        );
     }
 
     #[gpui::test]
