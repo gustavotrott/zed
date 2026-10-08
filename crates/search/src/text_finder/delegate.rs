@@ -89,6 +89,8 @@ pub struct Delegate {
     pub(crate) selected_matches: Vec<SelectedMatch>,
     pub(crate) collapsed_paths: HashSet<ProjectPath>,
     pub(crate) query_editor: Option<Entity<Editor>>,
+    pub(crate) replacement_editor: Option<Entity<Editor>>,
+    pub(crate) replace_enabled: bool,
     pub(crate) regex_language: Option<Arc<Language>>,
 }
 
@@ -330,6 +332,8 @@ impl Delegate {
                 selected_matches: Vec::new(),
                 collapsed_paths: HashSet::default(),
                 query_editor: None,
+                replacement_editor: None,
+                replace_enabled: false,
                 regex_language: None,
             });
 
@@ -812,6 +816,7 @@ impl PickerDelegate for Delegate {
             h_flex()
                 .gap_px()
                 .children(included_files_filter)
+                .child(self.render_replace_toggle(cx))
                 .children(filter_buttons)
                 .child(Divider::vertical().ml_px().mr_0p5())
                 .children(picker::parts::project_scan_indicator(
@@ -821,6 +826,14 @@ impl PickerDelegate for Delegate {
                 ))
                 .into_any_element(),
         )
+    }
+
+    fn searchbar_secondary_row(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        self.render_replace_row(cx)
     }
 
     fn actions_menu(

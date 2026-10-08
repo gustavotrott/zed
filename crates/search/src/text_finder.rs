@@ -23,10 +23,14 @@ use workspace::{
 
 mod delegate;
 mod render;
+mod replace;
 use delegate::{Delegate, matches_to_multibuffer};
 use util::ResultExt as _;
 
-use crate::{ProjectSearchView, SearchOptions, text_finder::delegate::PopulateProjectSearch};
+use crate::{
+    ProjectSearchView, ReplaceAll, ReplaceNext, SearchOptions, ToggleReplace,
+    text_finder::delegate::PopulateProjectSearch,
+};
 
 actions!(text_finder, [ToProjectSearch, Fold, Unfold, ToggleFoldAll]);
 
@@ -93,6 +97,7 @@ pub(crate) struct OpenFilters {
     included_files: Option<String>,
     excluded_files: Option<String>,
     option_overrides: Vec<(SearchOptions, bool)>,
+    replace_enabled: bool,
 }
 
 fn store_last_search(
@@ -275,6 +280,24 @@ impl TextFinder {
         self.open_in_split(workspace::SplitDirection::Down, window, cx);
     }
 
+    fn toggle_replace(&mut self, _: &ToggleReplace, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker.update(cx, |picker, cx| {
+            picker.delegate.toggle_replace(window, cx);
+        });
+    }
+
+    fn replace_next(&mut self, _: &ReplaceNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker.update(cx, |picker, cx| {
+            picker.delegate.replace_next(window, cx);
+        });
+    }
+
+    fn replace_all(&mut self, _: &ReplaceAll, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker.update(cx, |picker, cx| {
+            picker.delegate.replace_all(window, cx);
+        });
+    }
+
     fn fold(&mut self, _: &Fold, _window: &mut Window, cx: &mut Context<Self>) {
         self.picker.update(cx, |picker, cx| {
             picker.delegate.set_selected_group_collapsed(true, cx);
@@ -438,6 +461,7 @@ impl TextFinder {
             included_files: action.included_files.clone(),
             excluded_files: action.excluded_files.clone(),
             option_overrides,
+            replace_enabled: action.replace_enabled,
         };
         Self::open_with_filters(seed_query, filters, window, cx).detach();
     }
@@ -495,6 +519,11 @@ impl TextFinder {
         let languages = project.read(cx).languages().clone();
         let preview = picker_preview::editor_preview(project, window, cx);
         let query_editor = cx.new(|cx| Editor::single_line(window, cx));
+        let replacement_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Replace with…", window, cx);
+            editor
+        });
         let erased_query_editor = query_editor.update(cx, |editor, cx| editor.erased(cx));
         let picker = cx.new(|cx| {
             Picker::list_with_preview_and_query_editor(
@@ -510,6 +539,8 @@ impl TextFinder {
         picker.update(cx, |picker, cx| {
             picker.delegate.focus_handle = picker_focus_handle.clone();
             picker.delegate.query_editor = Some(query_editor);
+            picker.delegate.replacement_editor = Some(replacement_editor);
+            picker.delegate.replace_enabled = filters.replace_enabled;
             picker.delegate.hook_up_any_ongoing_search(picker_weak, cx);
             // Restore filters before seeding the query so the initial search runs with them.
             if let Some(options) = seed_query.as_ref().and_then(|seed| seed.options) {
@@ -609,7 +640,7 @@ mod tests {
     use std::sync::Arc;
 
     use gpui::{TestAppContext, UpdateGlobal as _, VisualTestContext};
-    use project::{FakeFs, Project};
+    use project::{FakeFs, Fs as _, Project};
     use serde_json::json;
     use settings::SettingsStore;
     use util::path;
@@ -753,6 +784,79 @@ mod tests {
                 .collect();
             assert_eq!(paths, vec!["sub/two.rs".to_string()]);
         });
+    }
+
+    #[gpui::test]
+    async fn test_replace_in_text_finder(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/dir"),
+            json!({
+                "one.rs": "let foo = foo_1 + foo;",
+                "two.rs": "fn foo() {}",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let seed_query = SearchSeed {
+            query: "foo(_\\d)?".to_string(),
+            options: Some(SearchOptions::REGEX),
+        };
+        workspace
+            .update_in(cx, |_, window, cx| {
+                TextFinder::open(Some(seed_query), window, cx)
+            })
+            .await;
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(500));
+        cx.run_until_parked();
+
+        let picker = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<TextFinder>(cx)
+                .expect("Text Finder should be open")
+                .read(cx)
+                .picker
+                .clone()
+        });
+        picker.update_in(cx, |picker, window, cx| {
+            assert_eq!(picker.delegate.matches.len(), 4);
+            picker.delegate.toggle_replace(window, cx);
+            let replacement_editor = picker.delegate.replacement_editor.clone().unwrap();
+            replacement_editor.update(cx, |editor, cx| editor.set_text("bar$1", window, cx));
+            picker.delegate.replace_next(window, cx);
+            assert_eq!(picker.delegate.matches.len(), 3);
+        });
+        cx.run_until_parked();
+        let one = fs.load(path!("/dir/one.rs").as_ref()).await.unwrap();
+        let two = fs.load(path!("/dir/two.rs").as_ref()).await.unwrap();
+        assert!(
+            (one == "let bar = foo_1 + foo;" && two == "fn foo() {}")
+                || (one == "let foo = foo_1 + foo;" && two == "fn bar() {}"),
+            "only the selected match should be replaced, got {one:?} and {two:?}"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.replace_all(window, cx);
+            assert!(picker.delegate.matches.is_empty());
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fs.load(path!("/dir/one.rs").as_ref()).await.unwrap(),
+            "let bar = bar_1 + bar;"
+        );
+        assert_eq!(
+            fs.load(path!("/dir/two.rs").as_ref()).await.unwrap(),
+            "fn bar() {}"
+        );
     }
 
     #[gpui::test]

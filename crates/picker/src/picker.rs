@@ -353,6 +353,16 @@ pub trait PickerDelegate: Sized + 'static {
         None
     }
 
+    /// An optional row rendered below the search bar, e.g. a second input.
+    /// Only used by the picker-rendered default search bar.
+    fn searchbar_secondary_row(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> Option<AnyElement> {
+        None
+    }
+
     /// Overrides the search bar entirely. Most delegates should return `None`
     /// to get the picker-rendered default (which includes
     /// [`Self::searchbar_trailer`] and the multi-select toggle); override for
@@ -1225,6 +1235,12 @@ impl<D: PickerDelegate> Picker<D> {
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let query = self.query(cx);
         self.update_matches(query, window, cx);
+    }
+
+    /// Lets the picker pick up matches the delegate changed outside of
+    /// [`PickerDelegate::update_matches`], keeping the scroll position.
+    pub fn matches_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.matches_updated(ScrollBehavior::PreserveOffset, window, cx);
     }
 
     pub fn update_matches(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
