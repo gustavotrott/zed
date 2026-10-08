@@ -125,6 +125,10 @@ To view File History:
 
 You can also find "Browse File History" in the editor's context menu and in the context menu of a file in the Git Panel. Browsing file history is only available for local projects.
 
+### History for Selection
+
+{#action git::ShowHistoryForSelection} opens the same picker, listing only the commits that changed the selected lines (or the line with the cursor), like `git log -L`. Lines you changed but haven't committed yet are mapped to their position in `HEAD` first. Each commit shows where the lines were in that commit, and its preview only shows the changes to those lines, with the lines highlighted. Find it as "Show History for Selection" in the editor's context menu.
+
 ## Tags
 
 To create a lightweight tag at `HEAD`, use {#action git::CreateTagAtHead} from the Command Palette. Tags are created locally and are not pushed automatically.
