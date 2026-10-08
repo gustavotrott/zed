@@ -534,6 +534,18 @@ pub struct CommitDiff {
     pub is_shallow_boundary: bool,
 }
 
+/// A commit that changed a file, as listed by [`GitRepository::file_log`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileLogEntry {
+    pub sha: SharedString,
+    pub author_name: SharedString,
+    pub commit_timestamp: i64,
+    pub subject: SharedString,
+    /// The path of the file in this commit, which differs from the queried path when the file
+    /// was renamed afterwards.
+    pub path: RepoPath,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileHistoryChangedFileSets {
     pub file_sets: Vec<Vec<RepoPath>>,
@@ -1129,6 +1141,14 @@ pub trait GitRepository: Send + Sync {
         paths: Vec<RepoPath>,
         commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileHistoryChangedFileSets>>>;
+
+    /// Lists the latest `commit_limit` commits that changed the file at `path`, newest first,
+    /// following renames.
+    fn file_log(
+        &self,
+        path: RepoPath,
+        commit_limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<FileLogEntry>>>;
 
     fn commit_data_reader(&self) -> Result<CommitDataReader>;
 
@@ -3581,6 +3601,35 @@ impl GitRepository for RealGitRepository {
         .boxed()
     }
 
+    fn file_log(
+        &self,
+        path: RepoPath,
+        commit_limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<FileLogEntry>>> {
+        let git = self.git_binary();
+        async move {
+            let max_count_arg = format!("--max-count={commit_limit}");
+            let args = [
+                "log",
+                max_count_arg.as_str(),
+                "--follow",
+                "--name-only",
+                "-z",
+                "--format=%x1e%H%x1f%an%x1f%at%x1f%s",
+                "--",
+                path.as_unix_str(),
+            ];
+            let output = git.build_command(&args).output().await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "git log failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_file_log_output(&String::from_utf8_lossy(&output.stdout), &path)
+        }
+        .boxed()
+    }
+
     fn commit_data_reader(&self) -> Result<CommitDataReader> {
         let git_binary = self.git_binary();
 
@@ -3688,6 +3737,38 @@ async fn read_single_commit_response<R: smol::io::AsyncBufRead + Unpin>(
     let content_str = String::from_utf8_lossy(&content);
     parse_cat_file_commit(*sha, &content_str)
         .ok_or_else(|| anyhow!("failed to parse commit {}", sha))
+}
+
+/// Parses `git log -z --name-only --format=%x1e%H%x1f%an%x1f%at%x1f%s`, where each commit is a
+/// record separator followed by the formatted fields, a NUL, and the NUL-terminated path of the
+/// file in that commit.
+fn parse_file_log_output(output: &str, queried_path: &RepoPath) -> Result<Vec<FileLogEntry>> {
+    output
+        .split('\x1e')
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let (header, path) = record.split_once('\0').unwrap_or((record, ""));
+            let mut fields = header.splitn(4, '\x1f');
+            let mut next_field = || fields.next().context("missing field in git log output");
+            let sha = next_field()?.to_string();
+            let author_name = next_field()?.to_string();
+            let commit_timestamp = next_field()?.parse().context("parsing commit timestamp")?;
+            let subject = next_field()?.to_string();
+            let path = path.trim_matches(['\n', '\0']);
+            let path = if path.is_empty() {
+                queried_path.clone()
+            } else {
+                RepoPath::new(path)?
+            };
+            Ok(FileLogEntry {
+                sha: sha.into(),
+                author_name: author_name.into(),
+                commit_timestamp,
+                subject: subject.into(),
+                path,
+            })
+        })
+        .collect()
 }
 
 fn parse_file_history_changed_files_output(
@@ -4478,6 +4559,59 @@ mod tests {
             original_repo_path_from_common_dir(&repository.common_dir).unwrap(),
             repo_dir.path(),
         );
+    }
+
+    #[gpui::test]
+    async fn test_file_log_follows_renames(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("old.txt"), "one\n").unwrap();
+        fs::write(repo_dir.path().join("other.txt"), "other\n").unwrap();
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "add files"]);
+        fs::write(repo_dir.path().join("other.txt"), "changed\n").unwrap();
+        git_command(repo_dir.path(), ["commit", "-am", "change other"]);
+        git_command(repo_dir.path(), ["mv", "old.txt", "new.txt"]);
+        git_command(repo_dir.path(), ["commit", "-m", "rename"]);
+        fs::write(repo_dir.path().join("new.txt"), "one\ntwo\n").unwrap();
+        git_command(repo_dir.path(), ["commit", "-am", "edit: with \"quotes\""]);
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+
+        let log = repository
+            .file_log(repo_path("new.txt"), 100)
+            .await
+            .unwrap();
+        let summary: Vec<_> = log
+            .iter()
+            .map(|entry| {
+                (
+                    entry.subject.to_string(),
+                    entry.path.as_unix_str().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("edit: with \"quotes\"".to_string(), "new.txt".to_string()),
+                ("rename".to_string(), "new.txt".to_string()),
+                ("add files".to_string(), "old.txt".to_string()),
+            ]
+        );
+        assert!(log.iter().all(|entry| entry.sha.len() == 40));
+
+        let limited = repository.file_log(repo_path("new.txt"), 1).await.unwrap();
+        assert_eq!(limited.len(), 1);
     }
 
     #[gpui::test]

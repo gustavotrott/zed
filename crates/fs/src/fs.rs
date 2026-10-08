@@ -2524,6 +2524,18 @@ impl FakeFs {
         .unwrap();
     }
 
+    pub fn set_file_log(
+        &self,
+        dot_git: &Path,
+        path: RepoPath,
+        log: Vec<git::repository::FileLogEntry>,
+    ) {
+        self.with_git_state(dot_git, true, |state| {
+            state.file_logs.insert(path, log);
+        })
+        .unwrap();
+    }
+
     pub fn set_graph_commits(&self, dot_git: &Path, commits: Vec<Arc<InitialGraphCommitData>>) {
         self.with_git_state(dot_git, true, |state| {
             state.graph_commits = commits;
