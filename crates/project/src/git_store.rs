@@ -40,9 +40,9 @@ use git::{
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
-        Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus,
-        Worktree as GitWorktree, delete_branch_flag, is_binary_content,
+        FileLogEntry, GitCommitTemplate, GitRepository, InitialGraphCommitData, LogOrder,
+        LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode, SearchCommitArgs,
+        UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -7166,6 +7166,23 @@ impl Repository {
                             .collect::<Result<Vec<_>>>()?,
                         is_shallow_boundary: response.is_shallow_boundary,
                     })
+                }
+            }
+        })
+    }
+
+    pub fn file_log(
+        &mut self,
+        path: RepoPath,
+        commit_limit: usize,
+    ) -> oneshot::Receiver<Result<Vec<FileLogEntry>>> {
+        self.send_job("file_log", None, move |git_repo, _cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.file_log(path, commit_limit).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("browsing file history is only supported locally")
                 }
             }
         })
