@@ -61,6 +61,9 @@ actions!(
         Blame,
         /// Shows the git history for the selected file, folder, or project.
         FileHistory,
+        /// Browses the commits that changed the current file in a picker, previewing the
+        /// file's diff in each commit.
+        BrowseFileHistory,
         /// Opens a permalink for the selected file on its Git hosting provider.
         OpenFilePermalink,
         /// Copies a permalink for the selected file on its Git hosting provider.
