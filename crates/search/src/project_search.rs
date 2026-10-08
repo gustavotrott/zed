@@ -215,7 +215,7 @@ pub fn init(cx: &mut App) {
 
         // Both on present and dismissed search, we need to unconditionally handle those actions to focus from the editor.
         workspace.register_action(move |workspace, action: &DeploySearch, window, cx| {
-            if use_text_finder(action, cx) {
+            if use_text_finder(cx) {
                 TextFinder::deploy(workspace, action, window, cx);
                 return;
             }
@@ -236,7 +236,7 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(
             move |workspace, action: &zed_actions::search::NewSearchInDirectory, window, cx| {
-                if use_text_finder(&DeploySearch::default(), cx) {
+                if use_text_finder(cx) {
                     TextFinder::deploy(
                         workspace,
                         &DeploySearch {
@@ -261,13 +261,11 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// See `SearchSettings::use_text_finder_for_project_search`. The Text Finder has
-/// no replace input, so searches that ask for replace still open a tab.
-fn use_text_finder(action: &DeploySearch, cx: &App) -> bool {
+/// See `SearchSettings::use_text_finder_for_project_search`.
+fn use_text_finder(cx: &App) -> bool {
     EditorSettings::get_global(cx)
         .search
         .use_text_finder_for_project_search
-        && !action.replace_enabled
 }
 
 fn contains_uppercase(str: &str) -> bool {
