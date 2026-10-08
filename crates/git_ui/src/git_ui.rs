@@ -44,6 +44,7 @@ pub mod commit_tooltip;
 pub mod commit_view;
 mod conflict_view;
 mod diff_multibuffer;
+mod file_history_picker;
 pub mod git_graph;
 pub mod git_panel;
 mod git_panel_settings;
@@ -116,6 +117,7 @@ pub fn init(cx: &mut App) {
         git_panel::register(workspace);
         repository_selector::register(workspace);
         git_picker::register(workspace);
+        file_history_picker::register(workspace);
 
         workspace.register_action(
             |workspace, action: &zed_actions::CreateWorktree, window, cx| {
