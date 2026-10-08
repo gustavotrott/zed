@@ -2,11 +2,12 @@
 //! selected commit. Confirming opens the file; the secondary confirm opens the commit, filtered
 //! to the file.
 
-use std::sync::Arc;
+use std::{ops::RangeInclusive, sync::Arc};
 
 use anyhow::Context as _;
 use editor::{
-    Editor, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer, PathKey, SplittableEditor,
+    Editor, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer, PathKey, RowHighlightOptions,
+    SplittableEditor,
 };
 use fuzzy::StringMatchCandidate;
 use git::repository::{FileLogEntry, RepoPath};
@@ -36,8 +37,83 @@ pub(crate) fn register(workspace: &mut Workspace) {
         let Some((repository, repo_path)) = file_history_target(workspace, window, cx) else {
             return;
         };
-        FileHistoryPicker::toggle(workspace, repository, repo_path, window, cx);
+        FileHistoryPicker::toggle(workspace, repository, repo_path, None, window, cx);
     });
+    workspace.register_action(|workspace, _: &git::ShowHistoryForSelection, window, cx| {
+        show_history_for_selection(workspace, window, cx).detach_and_log_err(cx);
+    });
+}
+
+/// Opens the picker listing the commits that changed the lines of the active editor's newest
+/// selection. `git log -L` addresses lines of the file at `HEAD`, so the selected rows are
+/// first mapped through the buffer's uncommitted changes.
+fn show_history_for_selection(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
+    let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
+        return Task::ready(Ok(()));
+    };
+    let (start, end) = editor.update(cx, |editor, cx| {
+        let selection = editor
+            .selections
+            .newest::<Point>(&editor.display_snapshot(cx));
+        let mut end = selection.end;
+        // A selection of whole lines ends at the start of the line after them.
+        if end.column == 0 && end.row > selection.start.row {
+            end.row -= 1;
+        }
+        (selection.start, end)
+    });
+    let multibuffer = editor.read(cx).buffer().read(cx);
+    let Some((buffer, start)) = multibuffer.point_to_buffer_point(start, cx) else {
+        return Task::ready(Ok(()));
+    };
+    let end = match multibuffer.point_to_buffer_point(end, cx) {
+        Some((end_buffer, end)) if end_buffer == buffer => end,
+        _ => start,
+    };
+    let Some(file) = buffer.read(cx).file() else {
+        return Task::ready(Ok(()));
+    };
+    let project_path = project::ProjectPath {
+        worktree_id: file.worktree_id(cx),
+        path: file.path().clone(),
+    };
+    let Some((repository, repo_path)) = workspace
+        .project()
+        .read(cx)
+        .git_store()
+        .read(cx)
+        .repository_and_path_for_project_path(&project_path, cx)
+    else {
+        return Task::ready(Ok(()));
+    };
+    let uncommitted_diff = workspace.project().update(cx, |project, cx| {
+        project.open_uncommitted_diff(buffer.clone(), cx)
+    });
+
+    cx.spawn_in(window, async move |workspace, cx| {
+        let uncommitted_diff = uncommitted_diff.await?;
+        let line_range = cx.update(|_, cx| {
+            let buffer = buffer.read(cx).text_snapshot();
+            let diff = uncommitted_diff.read(cx).snapshot(cx);
+            let start = diff.buffer_point_to_base_text_point(Point::new(start.row, 0), &buffer);
+            let end = diff.buffer_point_to_base_text_point(Point::new(end.row, 0), &buffer);
+            start.row + 1..=end.row.max(start.row) + 1
+        })?;
+        workspace.update_in(cx, |workspace, window, cx| {
+            FileHistoryPicker::toggle(
+                workspace,
+                repository,
+                repo_path,
+                Some(line_range),
+                window,
+                cx,
+            );
+        })
+    })
 }
 
 /// The file whose history to browse: the file selected in the focused git panel, or else the
@@ -80,13 +156,22 @@ impl FileHistoryPicker {
         workspace: &mut Workspace,
         repository: Entity<Repository>,
         repo_path: RepoPath,
+        line_range: Option<RangeInclusive<u32>>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
         let project = workspace.project().clone();
         let weak_workspace = workspace.weak_handle();
         workspace.toggle_modal(window, cx, |window, cx| {
-            Self::new(project, weak_workspace, repository, repo_path, window, cx)
+            Self::new(
+                project,
+                weak_workspace,
+                repository,
+                repo_path,
+                line_range,
+                window,
+                cx,
+            )
         });
     }
 
@@ -95,6 +180,7 @@ impl FileHistoryPicker {
         workspace: WeakEntity<Workspace>,
         repository: Entity<Repository>,
         repo_path: RepoPath,
+        line_range: Option<RangeInclusive<u32>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -105,6 +191,7 @@ impl FileHistoryPicker {
             workspace,
             repository: repository.clone(),
             repo_path: repo_path.clone(),
+            line_range: line_range.clone(),
             entries: None,
             matches: Vec::new(),
             selected_index: 0,
@@ -121,7 +208,7 @@ impl FileHistoryPicker {
         });
 
         let log = repository.update(cx, |repository, _| {
-            repository.file_log(repo_path, COMMIT_LIMIT)
+            repository.file_log(repo_path, line_range, COMMIT_LIMIT)
         });
         cx.spawn_in(window, {
             let picker = picker.downgrade();
@@ -180,6 +267,8 @@ pub struct FileHistoryDelegate {
     workspace: WeakEntity<Workspace>,
     repository: Entity<Repository>,
     repo_path: RepoPath,
+    /// The 1-based lines of the file at `HEAD` whose history is listed, or the whole file.
+    line_range: Option<RangeInclusive<u32>>,
     /// `None` until the history has loaded.
     entries: Option<Vec<FileLogEntry>>,
     matches: Vec<HistoryMatch>,
@@ -236,13 +325,31 @@ impl PickerDelegate for FileHistoryDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        format!("Search the history of {}…", self.repo_path.as_unix_str()).into()
+        let path = self.repo_path.as_unix_str();
+        match &self.line_range {
+            Some(lines) if lines.start() == lines.end() => {
+                format!("Search the history of {path}:{}…", lines.start()).into()
+            }
+            Some(lines) => format!(
+                "Search the history of {path}:{}-{}…",
+                lines.start(),
+                lines.end()
+            )
+            .into(),
+            None => format!("Search the history of {path}…").into(),
+        }
     }
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some(match &self.entries {
             None => "Loading history…".into(),
-            Some(entries) if entries.is_empty() => "No commits changed this file".into(),
+            Some(entries) if entries.is_empty() => {
+                if self.line_range.is_some() {
+                    "No commits changed these lines".into()
+                } else {
+                    "No commits changed this file".into()
+                }
+            }
             Some(_) => "No matching commits".into(),
         })
     }
@@ -419,6 +526,13 @@ impl PickerDelegate for FileHistoryDelegate {
         };
         let author_start = subject_range.end + 1;
         let renamed_from = (entry.path != self.repo_path).then(|| entry.path.as_unix_str());
+        let traced_lines = entry.line_range.as_ref().map(|lines| {
+            if lines.start() == lines.end() {
+                format!("· L{}", lines.start())
+            } else {
+                format!("· L{}–{}", lines.start(), lines.end())
+            }
+        });
 
         Some(
             ListItem::new(ix)
@@ -472,6 +586,13 @@ impl PickerDelegate for FileHistoryDelegate {
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                                 )
+                                .when_some(traced_lines, |this, traced_lines| {
+                                    this.child(
+                                        Label::new(traced_lines)
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                })
                                 .when_some(renamed_from, |this, path| {
                                     this.child(
                                         Label::new(format!("· {path}"))
@@ -506,6 +627,9 @@ impl PreviewBackend for CommitFilePreviewHandle {
         });
     }
 }
+
+/// Highlights the lines whose history is being browsed.
+struct TracedLinesHighlight;
 
 /// Shows the diff a commit made to one file, with every hunk expanded, side by side or unified
 /// according to the `diff_view_style` setting.
@@ -610,7 +734,8 @@ impl CommitFilePreview {
                 }
                 match result {
                     Ok(Some((buffer, diff))) => {
-                        this.editor = this.build_editor(buffer, diff, window, cx);
+                        this.editor =
+                            this.build_editor(buffer, diff, entry.line_range.clone(), window, cx);
                         this.message = None;
                     }
                     Ok(None) => {
@@ -632,21 +757,35 @@ impl CommitFilePreview {
         &self,
         buffer: Entity<language::Buffer>,
         diff: Entity<buffer_diff::BufferDiff>,
+        line_range: Option<RangeInclusive<u32>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<SplittableEditor>> {
         let workspace = self.workspace.upgrade()?;
+        let snapshot = buffer.read(cx).snapshot();
+        // When browsing the history of some lines, only show the changes to those lines.
+        let traced_rows = line_range.map(|lines| {
+            let max_row = snapshot.max_point().row;
+            let start = lines.start().saturating_sub(1).min(max_row);
+            let end = lines.end().saturating_sub(1).clamp(start, max_row);
+            Point::new(start, 0)..Point::new(end, snapshot.line_len(end))
+        });
         let hunk_ranges: Vec<_> = {
-            let snapshot = buffer.read(cx).snapshot();
             let diff_snapshot = diff.read(cx).snapshot(cx);
             let ranges: Vec<_> = diff_snapshot
                 .hunks(&snapshot)
                 .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+                .filter(|hunk_range| {
+                    traced_rows.as_ref().is_none_or(|traced_rows| {
+                        hunk_range.start.row <= traced_rows.end.row
+                            && hunk_range.end.row >= traced_rows.start.row
+                    })
+                })
                 .collect();
-            if ranges.is_empty() {
-                vec![Point::zero()..snapshot.max_point()]
-            } else {
-                ranges
+            match (&traced_rows, ranges.is_empty()) {
+                (Some(traced_rows), true) => vec![traced_rows.clone()],
+                (None, true) => vec![Point::zero()..snapshot.max_point()],
+                (_, false) => ranges,
             }
         };
         let multibuffer = cx.new(|_| MultiBuffer::new(Capability::ReadOnly));
@@ -670,12 +809,30 @@ impl CommitFilePreview {
             });
             editor.update_excerpts_for_path(
                 PathKey::for_buffer(&buffer, cx),
-                buffer,
+                buffer.clone(),
                 hunk_ranges,
                 editor::multibuffer_context_lines(cx),
                 diff,
                 cx,
             );
+            if let Some(traced_rows) = traced_rows {
+                editor.rhs_editor().update(cx, |editor, cx| {
+                    let multibuffer = editor.buffer().read(cx);
+                    let start = multibuffer.buffer_point_to_anchor(&buffer, traced_rows.start, cx);
+                    let end = multibuffer.buffer_point_to_anchor(&buffer, traced_rows.end, cx);
+                    if let Some((start, end)) = start.zip(end) {
+                        editor.highlight_rows::<TracedLinesHighlight>(
+                            start..end,
+                            |cx| cx.theme().colors().editor_highlighted_line_background,
+                            RowHighlightOptions {
+                                autoscroll: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                    }
+                });
+            }
             editor
         }))
     }
@@ -731,6 +888,7 @@ mod tests {
             commit_timestamp: 1_700_000_000,
             subject: subject.to_string().into(),
             path: RepoPath::new(path).unwrap(),
+            line_range: None,
         }
     }
 
@@ -777,6 +935,7 @@ mod tests {
                 workspace,
                 repository,
                 RepoPath::new("file.txt").unwrap(),
+                None,
                 window,
                 cx,
             );
@@ -852,5 +1011,135 @@ mod tests {
                 .expect("the file should be open");
             assert_eq!(editor.read(cx).text(cx), "contents");
         });
+    }
+
+    #[gpui::test]
+    async fn test_show_history_for_selection_maps_lines_to_head(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new(util::path!("/project")),
+            json!({
+                ".git": {},
+                "file.txt": "new 0\nnew 1\nzero\none\ntwo\n",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new(util::path!("/project/.git")),
+            &[("file.txt", "zero\none\ntwo\n".to_string())],
+            "deadbeef",
+        );
+        let project = Project::test(fs.clone(), [Path::new(util::path!("/project"))], cx).await;
+        cx.run_until_parked();
+
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    util::path!("/project/file.txt").into(),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        cx.run_until_parked();
+
+        // Select the lines "one" and "two", whole lines, ending at the start of the next line.
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(3, 0)..Point::new(5, 0)])
+            });
+        });
+        cx.dispatch_action(git::ShowHistoryForSelection);
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let picker = workspace
+                .active_modal::<FileHistoryPicker>(cx)
+                .expect("the picker should be open");
+            let delegate = &picker.read(cx).picker.read(cx).delegate;
+            assert_eq!(delegate.repo_path.as_unix_str(), "file.txt");
+            assert_eq!(delegate.line_range, Some(2..=3));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_preview_of_line_history_only_shows_traced_lines(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(Path::new(util::path!("/project")), json!({".git": {}}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(util::path!("/project"))], cx).await;
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+
+        let old_text: String = (1..=40).map(|line| format!("line {line}\n")).collect();
+        let new_text = old_text
+            .replace("line 2\n", "changed 2\n")
+            .replace("line 30\n", "changed 30\n");
+        let buffer = cx.new(|cx| language::Buffer::local(new_text, cx));
+        let diff = cx.new(|cx| {
+            buffer_diff::BufferDiff::new(&buffer.read(cx).text_snapshot(), None, None, cx)
+        });
+        diff.update(cx, |diff, cx| {
+            diff.set_base_text(
+                Some(Arc::from(old_text.as_str())),
+                buffer.read(cx).text_snapshot(),
+                cx,
+            )
+        })
+        .await;
+
+        let preview = cx.new_window_entity(|window, cx| {
+            CommitFilePreview::new(
+                project.clone(),
+                workspace.downgrade(),
+                repository,
+                window,
+                cx,
+            )
+        });
+        let text_for_lines = |line_range: Option<RangeInclusive<u32>>,
+                              cx: &mut VisualTestContext| {
+            let editor = preview
+                .update_in(cx, |preview, window, cx| {
+                    preview.build_editor(buffer.clone(), diff.clone(), line_range, window, cx)
+                })
+                .expect("the workspace exists");
+            cx.run_until_parked();
+            editor.read_with(cx, |editor, cx| editor.rhs_editor().read(cx).text(cx))
+        };
+
+        let traced = text_for_lines(Some(30..=30), cx);
+        assert!(traced.contains("changed 30"));
+        assert!(!traced.contains("changed 2\n"));
+
+        let whole_file = text_for_lines(None, cx);
+        assert!(whole_file.contains("changed 30"));
+        assert!(whole_file.contains("changed 2\n"));
     }
 }

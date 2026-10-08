@@ -1647,6 +1647,7 @@ impl GitRepository for FakeGitRepository {
     fn file_log(
         &self,
         path: RepoPath,
+        _line_range: Option<std::ops::RangeInclusive<u32>>,
         commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<git::repository::FileLogEntry>>> {
         self.with_state_async(false, move |state| {
