@@ -40,10 +40,10 @@ use git::{
     repository::{
         Branch, BranchesScanResult, CommitData, CommitDetails, CommitFileStatus, CommitOptions,
         CreateWorktreeTarget, DiffStatType, DiffType, FetchOptions, FileHistoryChangedFileSets,
-        GitCommitTemplate, GitRepository, GitRepositoryCheckpoint, InitialGraphCommitData,
-        LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput, RepoPath, ResetMode,
-        SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree, delete_branch_flag,
-        is_binary_content,
+        FileLogEntry, GitCommitTemplate, GitRepository, GitRepositoryCheckpoint,
+        InitialGraphCommitData, LogOrder, LogSource, PushOptions, Remote, RemoteCommandOutput,
+        RepoPath, ResetMode, SearchCommitArgs, UpstreamTrackingStatus, Worktree as GitWorktree,
+        delete_branch_flag, is_binary_content,
     },
     stash::{GitStash, StashEntry},
     status::{
@@ -7324,6 +7324,24 @@ impl Repository {
                             .collect::<Result<Vec<_>>>()?,
                         is_shallow_boundary: response.is_shallow_boundary,
                     })
+                }
+            }
+        })
+    }
+
+    pub fn file_log(
+        &mut self,
+        path: RepoPath,
+        line_range: Option<std::ops::RangeInclusive<u32>>,
+        commit_limit: usize,
+    ) -> oneshot::Receiver<Result<Vec<FileLogEntry>>> {
+        self.send_job("file_log", None, move |git_repo, _cx| async move {
+            match git_repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.file_log(path, line_range, commit_limit).await
+                }
+                RepositoryState::Remote(_) => {
+                    anyhow::bail!("browsing file history is only supported locally")
                 }
             }
         })
