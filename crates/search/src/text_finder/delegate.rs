@@ -767,9 +767,51 @@ impl PickerDelegate for Delegate {
             })
         });
 
+        let included_files_filter = self
+            .project_search_view
+            .read(cx)
+            .included_files_filter(cx)
+            .map(|filter| {
+                let picker = picker.clone();
+                h_flex()
+                    .max_w_48()
+                    .mr_1()
+                    .pl_1p5()
+                    .gap_1()
+                    .rounded_sm()
+                    .bg(cx.theme().colors().element_background)
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div().min_w_0().child(
+                            Label::new(filter)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate_start(),
+                        ),
+                    )
+                    .child(
+                        IconButton::new("text-finder-clear-included-files", IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Search the Whole Project"))
+                            .on_click(move |_, window, cx| {
+                                picker.update(cx, |picker, cx| {
+                                    picker.delegate.project_search_view.update(cx, |view, cx| {
+                                        view.clear_included_files_filter(window, cx);
+                                    });
+                                    picker.refresh(window, cx);
+                                });
+                            }),
+                    )
+            });
+
         Some(
             h_flex()
                 .gap_px()
+                .children(included_files_filter)
                 .children(filter_buttons)
                 .child(Divider::vertical().ml_px().mr_0p5())
                 .children(picker::parts::project_scan_indicator(
