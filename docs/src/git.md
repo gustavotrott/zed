@@ -119,6 +119,16 @@ To view File History:
 - Right-click on an editor tab and select "View File History"
 - Use the Command Palette and search for "file history"
 
+### Browse File History
+
+{#action git::BrowseFileHistory} opens the history of the current file in a picker instead of a tab. The picker lists the commits that changed the file (following renames), and moving through the list previews the changes each commit made to that file. The diff is shown side by side or unified, following the `diff_view_style` setting, and you can click into it to select and copy text. Type to filter the commits by message, author, or SHA. Clicking a commit selects it; double-click it or press `Enter` to open the file, or use `menu::SecondaryConfirm` (`cmd-enter` on macOS, `ctrl-enter` on Linux and Windows) to open the commit filtered to the file.
+
+You can also find "Browse File History" in the editor's context menu and in the context menu of a file in the Git Panel. Browsing file history is only available for local projects.
+
+### History for Selection
+
+{#action git::ShowHistoryForSelection} opens the same picker, listing only the commits that changed the selected lines (or the line with the cursor), like `git log -L`. Lines you changed but haven't committed yet are mapped to their position in `HEAD` first. Each commit shows where the lines were in that commit, and its preview only shows the changes to those lines, with the lines highlighted. Find it as "Show History for Selection" in the editor's context menu.
+
 ## Tags
 
 To create a lightweight tag at `HEAD`, use {#action git::CreateTagAtHead} from the Command Palette. Tags are created locally and are not pushed automatically.

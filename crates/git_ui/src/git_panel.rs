@@ -8442,6 +8442,10 @@ impl GitPanel {
                     context_menu
                         .separator()
                         .action(view_file_history_title, Box::new(git::FileHistory))
+                        .when(!plural, |context_menu| {
+                            context_menu
+                                .action("Browse File History", Box::new(git::BrowseFileHistory))
+                        })
                 })
         })
     }
