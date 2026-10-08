@@ -24,6 +24,7 @@ use text::LineEnding;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::ops::RangeInclusive;
 use std::sync::atomic::AtomicBool;
 
 use std::process::{ExitStatus, Output};
@@ -544,6 +545,9 @@ pub struct FileLogEntry {
     /// The path of the file in this commit, which differs from the queried path when the file
     /// was renamed afterwards.
     pub path: RepoPath,
+    /// When listing the history of a range of lines, the 1-based, inclusive lines of the file in
+    /// this commit that the range corresponds to.
+    pub line_range: Option<RangeInclusive<u32>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1144,9 +1148,13 @@ pub trait GitRepository: Send + Sync {
 
     /// Lists the latest `commit_limit` commits that changed the file at `path`, newest first,
     /// following renames.
+    ///
+    /// With `line_range`, the 1-based, inclusive range of lines of the file at `HEAD`, only
+    /// lists the commits that changed those lines (`git log -L`).
     fn file_log(
         &self,
         path: RepoPath,
+        line_range: Option<RangeInclusive<u32>>,
         commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileLogEntry>>>;
 
@@ -3604,21 +3612,33 @@ impl GitRepository for RealGitRepository {
     fn file_log(
         &self,
         path: RepoPath,
+        line_range: Option<RangeInclusive<u32>>,
         commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileLogEntry>>> {
         let git = self.git_binary();
         async move {
-            let max_count_arg = format!("--max-count={commit_limit}");
-            let args = [
-                "log",
-                max_count_arg.as_str(),
-                "--follow",
-                "--name-only",
-                "-z",
-                "--format=%x1e%H%x1f%an%x1f%at%x1f%s",
-                "--",
-                path.as_unix_str(),
+            let mut args = vec![
+                "log".to_string(),
+                format!("--max-count={commit_limit}"),
+                "-z".to_string(),
+                "--format=%x1e%H%x1f%an%x1f%at%x1f%s".to_string(),
             ];
+            match line_range {
+                // `-L` follows renames on its own. Its patch, limited to the traced lines, tells
+                // the path of the file and where the lines were in each commit.
+                Some(line_range) => args.extend([format!(
+                    "-L{},{}:{}",
+                    line_range.start(),
+                    line_range.end(),
+                    path.as_unix_str()
+                )]),
+                None => args.extend([
+                    "--follow".to_string(),
+                    "--name-only".to_string(),
+                    "--".to_string(),
+                    path.as_unix_str().to_string(),
+                ]),
+            }
             let output = git.build_command(&args).output().await?;
             anyhow::ensure!(
                 output.status.success(),
@@ -3747,18 +3767,22 @@ fn parse_file_log_output(output: &str, queried_path: &RepoPath) -> Result<Vec<Fi
         .split('\x1e')
         .filter(|record| !record.is_empty())
         .map(|record| {
-            let (header, path) = record.split_once('\0').unwrap_or((record, ""));
+            let (header, rest) = record.split_once('\0').unwrap_or((record, ""));
             let mut fields = header.splitn(4, '\x1f');
             let mut next_field = || fields.next().context("missing field in git log output");
             let sha = next_field()?.to_string();
             let author_name = next_field()?.to_string();
             let commit_timestamp = next_field()?.parse().context("parsing commit timestamp")?;
             let subject = next_field()?.to_string();
-            let path = path.trim_matches(['\n', '\0']);
-            let path = if path.is_empty() {
-                queried_path.clone()
+            let rest = rest.trim_matches(['\n', '\0']);
+            let (path, line_range) = if rest.starts_with("diff ") {
+                parse_line_log_patch(rest)
             } else {
-                RepoPath::new(path)?
+                (Some(rest).filter(|path| !path.is_empty()), None)
+            };
+            let path = match path {
+                Some(path) => RepoPath::new(path)?,
+                None => queried_path.clone(),
             };
             Ok(FileLogEntry {
                 sha: sha.into(),
@@ -3766,9 +3790,47 @@ fn parse_file_log_output(output: &str, queried_path: &RepoPath) -> Result<Vec<Fi
                 commit_timestamp,
                 subject: subject.into(),
                 path,
+                line_range,
             })
         })
         .collect()
+}
+
+/// Parses the patch `git log -L` prints for a commit, returning the path of the file in the
+/// commit and the 1-based lines the traced range spans in it.
+fn parse_line_log_patch(patch: &str) -> (Option<&str>, Option<RangeInclusive<u32>>) {
+    let mut path = None;
+    let mut line_range: Option<RangeInclusive<u32>> = None;
+    for line in patch.lines() {
+        if path.is_none()
+            && line_range.is_none()
+            && let Some(new_path) = line.strip_prefix("+++ b/")
+        {
+            path = Some(new_path);
+        } else if let Some(hunk_header) = line.strip_prefix("@@ ") {
+            // `@@ -old_start,old_count +new_start,new_count @@`, where a missing count means 1.
+            let Some(new_lines) = hunk_header
+                .split(' ')
+                .find_map(|range| range.strip_prefix('+'))
+            else {
+                continue;
+            };
+            let (start, count) = match new_lines.split_once(',') {
+                Some((start, count)) => (start.parse::<u32>(), count.parse::<u32>()),
+                None => (new_lines.parse::<u32>(), Ok(1)),
+            };
+            let (Ok(start), Ok(count)) = (start, count) else {
+                continue;
+            };
+            let start = start.max(1);
+            let end = start + count.saturating_sub(1);
+            line_range = Some(match line_range {
+                Some(range) => *range.start().min(&start)..=*range.end().max(&end),
+                None => start..=end,
+            });
+        }
+    }
+    (path, line_range)
 }
 
 fn parse_file_history_changed_files_output(
@@ -4588,7 +4650,7 @@ mod tests {
         .unwrap();
 
         let log = repository
-            .file_log(repo_path("new.txt"), 100)
+            .file_log(repo_path("new.txt"), None, 100)
             .await
             .unwrap();
         let summary: Vec<_> = log
@@ -4610,8 +4672,80 @@ mod tests {
         );
         assert!(log.iter().all(|entry| entry.sha.len() == 40));
 
-        let limited = repository.file_log(repo_path("new.txt"), 1).await.unwrap();
+        let limited = repository
+            .file_log(repo_path("new.txt"), None, 1)
+            .await
+            .unwrap();
         assert_eq!(limited.len(), 1);
+
+        let second_line_log = repository
+            .file_log(repo_path("new.txt"), Some(2..=2), 100)
+            .await
+            .unwrap();
+        let summary: Vec<_> = second_line_log
+            .iter()
+            .map(|entry| {
+                (
+                    entry.subject.to_string(),
+                    entry.path.as_unix_str().to_string(),
+                    entry.line_range.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(
+                "edit: with \"quotes\"".to_string(),
+                "new.txt".to_string(),
+                Some(2..=2)
+            )]
+        );
+
+        // The first line was only added, under the file's old name.
+        let first_line_log = repository
+            .file_log(repo_path("new.txt"), Some(1..=1), 100)
+            .await
+            .unwrap();
+        let summary: Vec<_> = first_line_log
+            .iter()
+            .map(|entry| {
+                (
+                    entry.subject.to_string(),
+                    entry.path.as_unix_str().to_string(),
+                    entry.line_range.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![("add files".to_string(), "old.txt".to_string(), Some(1..=1))]
+        );
+    }
+
+    #[test]
+    fn test_parse_line_log_patch() {
+        let patch = "diff --git a/src/old.rs b/src/new.rs\n\
+            --- a/src/old.rs\n\
+            +++ b/src/new.rs\n\
+            @@ -10,2 +12,3 @@\n \
+            context\n\
+            +added\n";
+        assert_eq!(
+            parse_line_log_patch(patch),
+            (Some("src/new.rs"), Some(12..=14))
+        );
+
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -3 +7 @@\n-x\n+y\n";
+        assert_eq!(parse_line_log_patch(patch), (Some("a.rs"), Some(7..=7)));
+
+        // A deleted range has no lines left; it's reported at the line before it.
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -3,2 +2,0 @@\n-x\n-y\n";
+        assert_eq!(parse_line_log_patch(patch), (Some("a.rs"), Some(2..=2)));
+
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n\
+            @@ -1,1 +1,2 @@\n+a\n b\n\
+            @@ -9,1 +10,1 @@\n-c\n+d\n";
+        assert_eq!(parse_line_log_patch(patch), (Some("a.rs"), Some(1..=10)));
     }
 
     #[gpui::test]
