@@ -3983,6 +3983,7 @@ mod tests {
                 regex: false,
                 center_on_match: false,
                 search_on_type: false,
+                use_text_finder_for_project_search: false,
             },
             cx,
         );
@@ -4047,6 +4048,7 @@ mod tests {
                 regex: false,
                 center_on_match: false,
                 search_on_type: false,
+                use_text_finder_for_project_search: false,
             },
             cx,
         );
@@ -4086,6 +4088,7 @@ mod tests {
                 regex: false,
                 center_on_match: false,
                 search_on_type: false,
+                use_text_finder_for_project_search: false,
             },
             cx,
         );
@@ -4616,6 +4619,9 @@ mod tests {
                         regex: Some(search_settings.regex),
                         center_on_match: Some(search_settings.center_on_match),
                         search_on_type: Some(search_settings.search_on_type),
+                        use_text_finder_for_project_search: Some(
+                            search_settings.use_text_finder_for_project_search,
+                        ),
                     });
                 });
             });

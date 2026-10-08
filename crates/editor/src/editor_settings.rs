@@ -204,6 +204,9 @@ pub struct SearchSettings {
     pub center_on_match: bool,
     /// Start searching as you type in project search, without pressing Enter.
     pub search_on_type: bool,
+    /// Whether "Find in Project" and the project panel's "Find in Folder" open
+    /// the Text Finder modal instead of a Project Search tab.
+    pub use_text_finder_for_project_search: bool,
 }
 
 impl EditorSettings {
@@ -311,6 +314,9 @@ impl Settings for EditorSettings {
                 regex: search.regex.unwrap(),
                 center_on_match: search.center_on_match.unwrap(),
                 search_on_type: search.search_on_type.unwrap(),
+                use_text_finder_for_project_search: search
+                    .use_text_finder_for_project_search
+                    .unwrap(),
             },
             auto_signature_help: editor.auto_signature_help.unwrap(),
             language_detection: editor.language_detection.unwrap(),

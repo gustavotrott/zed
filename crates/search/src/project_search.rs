@@ -215,6 +215,10 @@ pub fn init(cx: &mut App) {
 
         // Both on present and dismissed search, we need to unconditionally handle those actions to focus from the editor.
         workspace.register_action(move |workspace, action: &DeploySearch, window, cx| {
+            if use_text_finder(cx) {
+                TextFinder::deploy(workspace, action, window, cx);
+                return;
+            }
             if workspace.has_active_modal(window, cx) && !workspace.hide_modal(window, cx) {
                 cx.propagate();
                 return;
@@ -232,6 +236,18 @@ pub fn init(cx: &mut App) {
         });
         workspace.register_action(
             move |workspace, action: &zed_actions::search::NewSearchInDirectory, window, cx| {
+                if use_text_finder(cx) {
+                    TextFinder::deploy(
+                        workspace,
+                        &DeploySearch {
+                            included_files: Some(action.directory.clone()),
+                            ..DeploySearch::default()
+                        },
+                        window,
+                        cx,
+                    );
+                    return;
+                }
                 ProjectSearchView::new_search_with_filter(
                     workspace,
                     action.directory.clone(),
@@ -243,6 +259,13 @@ pub fn init(cx: &mut App) {
         );
     })
     .detach();
+}
+
+/// See `SearchSettings::use_text_finder_for_project_search`.
+fn use_text_finder(cx: &App) -> bool {
+    EditorSettings::get_global(cx)
+        .search
+        .use_text_finder_for_project_search
 }
 
 fn contains_uppercase(str: &str) -> bool {
@@ -2212,6 +2235,41 @@ impl ProjectSearchView {
             .parse_path_matches(self.excluded_files_editor.read(cx).text(cx), cx)
             .unwrap_or_default();
         (included, excluded)
+    }
+
+    /// Sets the include/exclude filters, enabling the filters when either is set.
+    pub(crate) fn set_path_filters(
+        &mut self,
+        included_files: Option<&str>,
+        excluded_files: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(included_files) = included_files {
+            self.set_search_editor(SearchInputKind::Include, included_files, window, cx);
+            self.filters_enabled = true;
+        }
+        if let Some(excluded_files) = excluded_files {
+            self.set_search_editor(SearchInputKind::Exclude, excluded_files, window, cx);
+            self.filters_enabled = true;
+        }
+    }
+
+    /// The include filter text, if filters are enabled and it isn't empty.
+    pub(crate) fn included_files_filter(&self, cx: &App) -> Option<String> {
+        if !self.filters_enabled {
+            return None;
+        }
+        let text = self.included_files_editor.read(cx).text(cx);
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    pub(crate) fn clear_included_files_filter(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_search_editor(SearchInputKind::Include, "", window, cx);
     }
 
     fn parse_path_matches(&self, text: String, cx: &App) -> anyhow::Result<PathMatcher> {
