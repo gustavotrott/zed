@@ -1,7 +1,7 @@
 //! A picker listing the commits that changed a file, previewing the file's diff in the
 //! selected commit. Confirming opens the commit, filtered to the file.
 
-use std::sync::Arc;
+use std::{ops::RangeInclusive, sync::Arc};
 
 use anyhow::Context as _;
 use editor::{Editor, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer, PathKey};
@@ -33,8 +33,83 @@ pub(crate) fn register(workspace: &mut Workspace) {
         let Some((repository, repo_path)) = file_history_target(workspace, window, cx) else {
             return;
         };
-        FileHistoryPicker::toggle(workspace, repository, repo_path, window, cx);
+        FileHistoryPicker::toggle(workspace, repository, repo_path, None, window, cx);
     });
+    workspace.register_action(|workspace, _: &git::ShowHistoryForSelection, window, cx| {
+        show_history_for_selection(workspace, window, cx).detach_and_log_err(cx);
+    });
+}
+
+/// Opens the picker listing the commits that changed the lines of the active editor's newest
+/// selection. `git log -L` addresses lines of the file at `HEAD`, so the selected rows are
+/// first mapped through the buffer's uncommitted changes.
+fn show_history_for_selection(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
+    let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
+        return Task::ready(Ok(()));
+    };
+    let (start, end) = editor.update(cx, |editor, cx| {
+        let selection = editor
+            .selections
+            .newest::<Point>(&editor.display_snapshot(cx));
+        let mut end = selection.end;
+        // A selection of whole lines ends at the start of the line after them.
+        if end.column == 0 && end.row > selection.start.row {
+            end.row -= 1;
+        }
+        (selection.start, end)
+    });
+    let multibuffer = editor.read(cx).buffer().read(cx);
+    let Some((buffer, start)) = multibuffer.point_to_buffer_point(start, cx) else {
+        return Task::ready(Ok(()));
+    };
+    let end = match multibuffer.point_to_buffer_point(end, cx) {
+        Some((end_buffer, end)) if end_buffer == buffer => end,
+        _ => start,
+    };
+    let Some(file) = buffer.read(cx).file() else {
+        return Task::ready(Ok(()));
+    };
+    let project_path = project::ProjectPath {
+        worktree_id: file.worktree_id(cx),
+        path: file.path().clone(),
+    };
+    let Some((repository, repo_path)) = workspace
+        .project()
+        .read(cx)
+        .git_store()
+        .read(cx)
+        .repository_and_path_for_project_path(&project_path, cx)
+    else {
+        return Task::ready(Ok(()));
+    };
+    let uncommitted_diff = workspace.project().update(cx, |project, cx| {
+        project.open_uncommitted_diff(buffer.clone(), cx)
+    });
+
+    cx.spawn_in(window, async move |workspace, cx| {
+        let uncommitted_diff = uncommitted_diff.await?;
+        let line_range = cx.update(|_, cx| {
+            let buffer = buffer.read(cx).text_snapshot();
+            let diff = uncommitted_diff.read(cx).snapshot(cx);
+            let start = diff.buffer_point_to_base_text_point(Point::new(start.row, 0), &buffer);
+            let end = diff.buffer_point_to_base_text_point(Point::new(end.row, 0), &buffer);
+            start.row + 1..=end.row.max(start.row) + 1
+        })?;
+        workspace.update_in(cx, |workspace, window, cx| {
+            FileHistoryPicker::toggle(
+                workspace,
+                repository,
+                repo_path,
+                Some(line_range),
+                window,
+                cx,
+            );
+        })
+    })
 }
 
 /// The file whose history to browse: the file selected in the focused git panel, or else the
@@ -77,13 +152,22 @@ impl FileHistoryPicker {
         workspace: &mut Workspace,
         repository: Entity<Repository>,
         repo_path: RepoPath,
+        line_range: Option<RangeInclusive<u32>>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
         let project = workspace.project().clone();
         let weak_workspace = workspace.weak_handle();
         workspace.toggle_modal(window, cx, |window, cx| {
-            Self::new(project, weak_workspace, repository, repo_path, window, cx)
+            Self::new(
+                project,
+                weak_workspace,
+                repository,
+                repo_path,
+                line_range,
+                window,
+                cx,
+            )
         });
     }
 
@@ -92,6 +176,7 @@ impl FileHistoryPicker {
         workspace: WeakEntity<Workspace>,
         repository: Entity<Repository>,
         repo_path: RepoPath,
+        line_range: Option<RangeInclusive<u32>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -100,6 +185,7 @@ impl FileHistoryPicker {
             workspace,
             repository: repository.clone(),
             repo_path: repo_path.clone(),
+            line_range: line_range.clone(),
             entries: None,
             matches: Vec::new(),
             selected_index: 0,
@@ -116,7 +202,7 @@ impl FileHistoryPicker {
         });
 
         let log = repository.update(cx, |repository, _| {
-            repository.file_log(repo_path, COMMIT_LIMIT)
+            repository.file_log(repo_path, line_range, COMMIT_LIMIT)
         });
         cx.spawn_in(window, {
             let picker = picker.downgrade();
@@ -175,6 +261,8 @@ pub struct FileHistoryDelegate {
     workspace: WeakEntity<Workspace>,
     repository: Entity<Repository>,
     repo_path: RepoPath,
+    /// The 1-based lines of the file at `HEAD` whose history is listed, or the whole file.
+    line_range: Option<RangeInclusive<u32>>,
     /// `None` until the history has loaded.
     entries: Option<Vec<FileLogEntry>>,
     matches: Vec<HistoryMatch>,
@@ -231,13 +319,31 @@ impl PickerDelegate for FileHistoryDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        format!("Search the history of {}…", self.repo_path.as_unix_str()).into()
+        let path = self.repo_path.as_unix_str();
+        match &self.line_range {
+            Some(lines) if lines.start() == lines.end() => {
+                format!("Search the history of {path}:{}…", lines.start()).into()
+            }
+            Some(lines) => format!(
+                "Search the history of {path}:{}-{}…",
+                lines.start(),
+                lines.end()
+            )
+            .into(),
+            None => format!("Search the history of {path}…").into(),
+        }
     }
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some(match &self.entries {
             None => "Loading history…".into(),
-            Some(entries) if entries.is_empty() => "No commits changed this file".into(),
+            Some(entries) if entries.is_empty() => {
+                if self.line_range.is_some() {
+                    "No commits changed these lines".into()
+                } else {
+                    "No commits changed this file".into()
+                }
+            }
             Some(_) => "No matching commits".into(),
         })
     }
@@ -705,6 +811,7 @@ mod tests {
                 workspace,
                 repository,
                 RepoPath::new("file.txt").unwrap(),
+                None,
                 window,
                 cx,
             );
@@ -756,6 +863,69 @@ mod tests {
                 picker.delegate.preview.read(cx).shown_sha.as_deref(),
                 Some("b".repeat(40).as_str())
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_show_history_for_selection_maps_lines_to_head(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new(util::path!("/project")),
+            json!({
+                ".git": {},
+                "file.txt": "new 0\nnew 1\nzero\none\ntwo\n",
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            Path::new(util::path!("/project/.git")),
+            &[("file.txt", "zero\none\ntwo\n".to_string())],
+            "deadbeef",
+        );
+        let project = Project::test(fs.clone(), [Path::new(util::path!("/project"))], cx).await;
+        cx.run_until_parked();
+
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window.into(), cx);
+
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    util::path!("/project/file.txt").into(),
+                    workspace::OpenOptions::default(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+        cx.run_until_parked();
+
+        // Select the lines "one" and "two", whole lines, ending at the start of the next line.
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(3, 0)..Point::new(5, 0)])
+            });
+        });
+        cx.dispatch_action(git::ShowHistoryForSelection);
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let picker = workspace
+                .active_modal::<FileHistoryPicker>(cx)
+                .expect("the picker should be open");
+            let delegate = &picker.read(cx).picker.read(cx).delegate;
+            assert_eq!(delegate.repo_path.as_unix_str(), "file.txt");
+            assert_eq!(delegate.line_range, Some(2..=3));
         });
     }
 }
