@@ -27,6 +27,8 @@ Open any file in your project with {#kb file_finder::Toggle}. Type part of the f
 
 Quickly find any string in your project and open the file with {#kb project_search::OpenTextFinder}. Changed your mind and want a more detailed search with extra filters? Move to the project search using the button in the Actions menu in the right bottom corner.
 
+To replace text, toggle replace with {#kb search::ToggleReplace} (or the replace button next to the search options) and type the replacement. Press `Enter` in the replacement field to replace the selected match and move to the next one, or use `search::ReplaceAll` to replace every match (only the selected matches when using multi-select). Replaced files are saved, unless they already had unsaved changes.
+
 ## Project Search
 
 Search across all files with {#kb pane::DeploySearch}. Type the query in the search field, then press Enter to run the search.
