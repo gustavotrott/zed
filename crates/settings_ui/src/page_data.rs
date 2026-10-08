@@ -3932,7 +3932,7 @@ fn search_and_files_page() -> SettingsPage {
         ]
     }
 
-    fn file_finder_section() -> [SettingsPageItem; 5] {
+    fn file_finder_section() -> [SettingsPageItem; 6] {
         [
             SettingsPageItem::SectionHeader("File Finder"),
             // todo: null by default
@@ -4019,6 +4019,22 @@ fn search_and_files_page() -> SettingsPage {
                             .file_finder
                             .get_or_insert_default()
                             .prefill_query_from_selection = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Editable Picker Preview",
+                description: "Allow editing in the preview of the text finder and file finder. Edits are saved when selecting another result or closing the picker.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("editable_picker_preview"),
+                    pick: |settings_content| {
+                        settings_content.workspace.editable_picker_preview.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.workspace.editable_picker_preview = value;
                     },
                 }),
                 metadata: None,

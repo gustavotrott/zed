@@ -1099,6 +1099,7 @@ impl VsCodeSettings {
             show_call_status_icon: None,
             use_system_path_prompts: self.read_bool("files.simpleDialog.enable").map(|b| !b),
             use_system_prompts: None,
+            editable_picker_preview: None,
             use_system_window_tabs: self.read_bool("window.nativeTabs"),
             fullscreen_mode: self.read_bool("window.nativeFullScreen").map(|b| {
                 if b {
