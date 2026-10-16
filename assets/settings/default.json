@@ -827,6 +827,9 @@
     "center_on_match": false,
     // Start searching as you type in project search, without pressing Enter.
     "search_on_type": true,
+    // Whether "Find in Project" (`pane::DeploySearch`) and the project panel's
+    // "Find in Folder" open the Text Finder modal instead of a Project Search tab.
+    "use_text_finder_for_project_search": false,
   },
   // When to populate a new search's query based on the text under the cursor.
   // This setting can take the following three values:
