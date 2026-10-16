@@ -388,6 +388,11 @@ pub trait PickerDelegate: Sized + 'static {
         None
     }
 
+    /// Where to show the preview until the user picks a layout, which is then remembered.
+    fn default_preview_layout(&self) -> PreviewLayout {
+        PreviewLayout::Hidden
+    }
+
     /// Called on the delegate when opening a preview to the side. Delegates can
     /// then change how much space they use for rendering the match
     fn preview_layout_changed(&mut self, _layout_is_horizontal: bool) {}
@@ -438,6 +443,12 @@ pub trait PickerDelegate: Sized + 'static {
         _cx: &mut Context<Picker<Self>>,
     ) -> Vec<footer::PickerAction> {
         Vec::new()
+    }
+
+    /// Whether clicking an item only selects it, leaving confirming to a double click. Useful
+    /// for pickers whose preview is the main thing to look at.
+    fn confirm_on_double_click(&self) -> bool {
+        false
     }
 
     fn documentation_aside(
@@ -614,7 +625,7 @@ impl<D: PickerDelegate> Picker<D> {
             preview.layout = persistence::load_last_preview_layout(D::name(), cx)
                 .log_err()
                 .flatten()
-                .unwrap_or_default();
+                .unwrap_or_else(|| delegate.default_preview_layout());
         };
         let has_preview = preview.is_some();
         let persisted_shape =
@@ -1180,6 +1191,7 @@ impl<D: PickerDelegate> Picker<D> {
         &mut self,
         ix: usize,
         secondary: bool,
+        click_count: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1189,6 +1201,10 @@ impl<D: PickerDelegate> Picker<D> {
             return;
         }
         self.set_selected_index(ix, None, false, window, cx);
+        if self.delegate.confirm_on_double_click() && click_count < 2 {
+            cx.notify();
+            return;
+        }
         if self.delegate.supports_multi_select() && (secondary || self.select_instead_of_open) {
             self.select_instead_of_open = true;
             self.delegate.toggle_item_selected(ix, window, cx);
@@ -1509,7 +1525,13 @@ impl<D: PickerDelegate> Picker<D> {
                 })
             })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.handle_click(ix, event.modifiers().secondary(), window, cx)
+                this.handle_click(
+                    ix,
+                    event.modifiers().secondary(),
+                    event.click_count(),
+                    window,
+                    cx,
+                )
             }))
             // As of this writing, GPUI intercepts `ctrl-[mouse-event]`s on macOS
             // and produces right mouse button events. This matches platforms norms
@@ -1520,7 +1542,7 @@ impl<D: PickerDelegate> Picker<D> {
                 cx.listener(move |this, event: &MouseUpEvent, window, cx| {
                     // We specifically want to use the platform key here, as
                     // ctrl will already be held down for the tab switcher.
-                    this.handle_click(ix, event.modifiers.platform, window, cx)
+                    this.handle_click(ix, event.modifiers.platform, 1, window, cx)
                 }),
             )
             .when(self.delegate.select_on_hover(), |this| {
@@ -1731,6 +1753,7 @@ mod tests {
         supports_multi_select: bool,
         selected_items: Vec<usize>,
         multi_confirmed: Rc<Cell<Option<Vec<usize>>>>,
+        confirm_on_double_click: bool,
     }
 
     impl TestDelegate {
@@ -1744,6 +1767,7 @@ mod tests {
                 supports_multi_select: false,
                 selected_items: Vec::new(),
                 multi_confirmed: Rc::new(Cell::new(None)),
+                confirm_on_double_click: false,
             }
         }
 
@@ -1822,6 +1846,10 @@ mod tests {
 
         fn supports_multi_select(&self) -> bool {
             self.supports_multi_select
+        }
+
+        fn confirm_on_double_click(&self) -> bool {
+            self.confirm_on_double_click
         }
 
         fn is_item_selected(&self, ix: usize) -> bool {
@@ -1951,7 +1979,7 @@ mod tests {
         });
 
         picker.update_in(cx, |picker, window, cx| {
-            picker.handle_click(1, false, window, cx);
+            picker.handle_click(1, false, 1, window, cx);
         });
         assert!(
             confirmed_index.get().is_none(),
@@ -1959,12 +1987,43 @@ mod tests {
         );
 
         picker.update_in(cx, |picker, window, cx| {
-            picker.handle_click(0, false, window, cx);
+            picker.handle_click(0, false, 1, window, cx);
         });
         assert_eq!(
             confirmed_index.get(),
             Some(0),
             "clicking a selectable item should confirm"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_confirm_on_double_click(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let confirmed_index = Rc::new(Cell::new(None));
+        let (picker, cx) = cx.add_window_view(|window, cx| {
+            let mut delegate = TestDelegate::new(vec![true, true, true]);
+            delegate.confirmed_index = confirmed_index.clone();
+            delegate.confirm_on_double_click = true;
+            Picker::uniform_list(delegate, window, cx)
+        });
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.handle_click(2, false, 1, window, cx);
+            assert_eq!(picker.delegate.selected_index(), 2);
+        });
+        assert!(
+            confirmed_index.get().is_none(),
+            "a single click should only select the item"
+        );
+
+        picker.update_in(cx, |picker, window, cx| {
+            picker.handle_click(2, false, 2, window, cx);
+        });
+        assert_eq!(
+            confirmed_index.get(),
+            Some(2),
+            "a double click should confirm the item"
         );
     }
 
@@ -2018,7 +2077,7 @@ mod tests {
 
         // A plain click confirms just like in any picker.
         picker.update_in(cx, |picker, window, cx| {
-            picker.handle_click(1, false, window, cx);
+            picker.handle_click(1, false, 1, window, cx);
         });
         assert_eq!(confirmed_index.take(), Some(1));
         picker.update(cx, |picker, _cx| {
@@ -2028,7 +2087,7 @@ mod tests {
         // A secondary (cmd) click starts multi-select mode and toggles the
         // clicked item into the selection instead of confirming.
         picker.update_in(cx, |picker, window, cx| {
-            picker.handle_click(2, true, window, cx);
+            picker.handle_click(2, true, 1, window, cx);
         });
         assert_eq!(confirmed_index.take(), None, "cmd+click must not confirm");
         picker.update(cx, |picker, _cx| {
@@ -2041,7 +2100,7 @@ mod tests {
 
         // While the mode is on, plain clicks toggle items too.
         picker.update_in(cx, |picker, window, cx| {
-            picker.handle_click(0, false, window, cx);
+            picker.handle_click(0, false, 1, window, cx);
         });
         assert_eq!(
             confirmed_index.take(),
@@ -2060,7 +2119,7 @@ mod tests {
         });
         assert_eq!(multi_confirmed.take(), Some(vec![2, 0]));
         picker.update_in(cx, |picker, window, cx| {
-            picker.handle_click(1, false, window, cx);
+            picker.handle_click(1, false, 1, window, cx);
         });
         assert_eq!(
             confirmed_index.take(),
@@ -2124,7 +2183,7 @@ mod tests {
 
         picker.update_in(cx, |picker, window, cx| {
             picker.toggle_multi_select(&ToggleMultiSelect, window, cx);
-            picker.handle_click(0, false, window, cx);
+            picker.handle_click(0, false, 1, window, cx);
             picker.toggle_multi_select(&ToggleMultiSelect, window, cx);
         });
         picker.update(cx, |picker, _cx| {
