@@ -44,6 +44,7 @@
     "context": "TextFinder || (TextFinder > Picker > Editor) || (TextFinder > Picker > menu)",
     "bindings": {
       "ctrl-alt-f": "text_finder::ToProjectSearch",
+      "ctrl-shift-h": "search::ToggleReplace",
       "tab": "picker::MultiSelectNext",
       "ctrl-j": "pane::SplitDown",
       "ctrl-k": "pane::SplitUp",
@@ -52,6 +53,13 @@
       "ctrl-{": "text_finder::Fold",
       "ctrl-}": "text_finder::Unfold",
       "ctrl-shift-enter": "text_finder::ToggleFoldAll",
+    },
+  },
+  {
+    "context": "TextFinderReplace > Editor",
+    "bindings": {
+      "enter": "search::ReplaceNext",
+      "ctrl-alt-enter": "search::ReplaceAll",
     },
   },
 ]
