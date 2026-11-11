@@ -1020,6 +1020,9 @@ pub struct SearchSettingsContent {
     pub center_on_match: Option<bool>,
     /// Start searching as you type in project search, without pressing Enter.
     pub search_on_type: Option<bool>,
+    /// Whether "Find in Project" and the project panel's "Find in Folder" open
+    /// the Text Finder modal instead of a Project Search tab.
+    pub use_text_finder_for_project_search: Option<bool>,
 }
 
 #[with_fallible_options]

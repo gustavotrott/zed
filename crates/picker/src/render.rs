@@ -121,6 +121,7 @@ impl<D: PickerDelegate> Picker<D> {
                         this.child(self.render_multi_select_toggle(cx))
                     }),
             )
+            .children(self.delegate.searchbar_secondary_row(window, cx))
             .when(editor_position == PickerEditorPosition::Start, |this| {
                 this.child(Divider::horizontal())
             })
