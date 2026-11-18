@@ -89,6 +89,7 @@ pub struct FakeGitRepositoryState {
     pub fetches: Arc<Mutex<Vec<FetchOptions>>>,
     pub commit_template: Option<GitCommitTemplate>,
     pub blob_read_gate: Option<FakeBlobReadGate>,
+    pub file_logs: HashMap<RepoPath, Vec<git::repository::FileLogEntry>>,
 }
 
 impl FakeGitRepositoryState {
@@ -122,6 +123,7 @@ impl FakeGitRepositoryState {
             stash_entries: Default::default(),
             fetches: Arc::default(),
             commit_template: None,
+            file_logs: Default::default(),
         }
     }
 }
@@ -1675,6 +1677,19 @@ impl GitRepository for FakeGitRepository {
         _commit_limit: usize,
     ) -> BoxFuture<'_, Result<Vec<FileHistoryChangedFileSets>>> {
         async move { Ok(vec![FileHistoryChangedFileSets::default(); paths.len()]) }.boxed()
+    }
+
+    fn file_log(
+        &self,
+        path: RepoPath,
+        _line_range: Option<std::ops::RangeInclusive<u32>>,
+        commit_limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<git::repository::FileLogEntry>>> {
+        self.with_state_async(false, move |state| {
+            let mut log = state.file_logs.get(&path).cloned().unwrap_or_default();
+            log.truncate(commit_limit);
+            Ok(log)
+        })
     }
 
     fn commit_data_reader(&self) -> Result<CommitDataReader> {
