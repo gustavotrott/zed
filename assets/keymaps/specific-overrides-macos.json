@@ -49,6 +49,7 @@
     "use_key_equivalents": true,
     "bindings": {
       "alt-cmd-f": "text_finder::ToProjectSearch",
+      "cmd-shift-h": "search::ToggleReplace",
       "tab": "picker::MultiSelectNext",
       "alt-cmd-[": "text_finder::Fold",
       "alt-cmd-]": "text_finder::Unfold",
@@ -57,6 +58,14 @@
       "cmd-k": "pane::SplitUp",
       "cmd-h": "pane::SplitLeft",
       "cmd-l": "pane::SplitRight",
+    },
+  },
+  {
+    "context": "TextFinderReplace > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "search::ReplaceNext",
+      "cmd-enter": "search::ReplaceAll",
     },
   },
 ]
